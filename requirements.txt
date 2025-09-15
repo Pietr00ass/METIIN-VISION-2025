@@ -1,0 +1,13 @@
+pynput
+opencv-python
+pypiwin32
+
+ultralytics==8.0.196
+
+tesseract
+pytesseract
+spacy
+
+loguru
+click
+pydantic
