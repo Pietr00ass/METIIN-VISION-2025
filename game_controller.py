@@ -1,12 +1,12 @@
+import ntpath
 import os
 import re
+from pathlib import Path
 from random import choice, choices, uniform
 from time import perf_counter, sleep
 from typing import Generator, Optional, Tuple
 
 import pytesseract
-
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR/tesseract.exe"
 
 import cv2
 import numpy as np
@@ -21,7 +21,9 @@ from pynput.mouse import Listener as MouseListener
 
 import positions
 from settings import (
+    GAME_EXE_PATH,
     GAME_VIEW_POLY_OFF_BTN_POS,
+    TESSERACT_CMD,
     WINDOW_HEIGHT,
     WINDOW_NAME,
     WINDOW_WIDTH,
@@ -31,6 +33,9 @@ from settings import (
 )
 from utils import Success
 from vision_detector import VisionDetector
+
+
+pytesseract.pytesseract.tesseract_cmd = str(TESSERACT_CMD)
 
 
 def scale_img(img, scale=5):
@@ -71,7 +76,7 @@ class GameController:
         self.start_delay = start_delay
 
         self.saved_credentials_idx = saved_credentials_idx
-        self.game_exe_path = r"C:\BOT\ValiumAkademia\valium.exe"  # vm
+        self.game_exe_path = Path(GAME_EXE_PATH)
 
         self.keyboard = KeyboardController()
         self.keyboard_listener = self._init_keyboard_listener()
@@ -626,11 +631,13 @@ class GameController:
 
     def open_game(self, load_wait: float = 30):
         logger.info("Opening the game...")
-        game_dir = os.path.dirname(
-            self.game_exe_path
-        )  # Assumes the game's working directory is its location.
-        # Set the working directory to the game's directory and run as admin.
-        command = rf'Powershell -Command "&{{Set-Location -Path {game_dir}; Start-Process "{self.game_exe_path}" -Verb RunAs}}"'
+        game_path_str = str(self.game_exe_path)
+        game_dir = ntpath.dirname(game_path_str) or "."
+        command = (
+            'Powershell -Command '
+            f'"&{{Set-Location -Path \\"{game_dir}\\"; '
+            f'Start-Process \\"{game_path_str}\\" -Verb RunAs}}"'
+        )
         os.system(command)
         logger.debug(f"Waiting for the game to load... ({load_wait}s)")
         sleep(load_wait)  # wait for the game to load

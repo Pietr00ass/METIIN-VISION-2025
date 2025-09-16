@@ -4,8 +4,6 @@ from typing import Tuple
 
 import pytesseract
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR/tesseract.exe'
-
 import cv2
 import numpy as np
 import win32con
@@ -20,6 +18,7 @@ from settings import (
     RUNO_LESNE_DROPPED_FPATH,
     TEMPLATE_BUTELKA_DYWIZJI_FPATH,
     TEMPLATE_VALIUM_MSG_FPATH,
+    TESSERACT_CMD,
     VISION_EFFECTS_BBOX,
     WINDOW_HEIGHT,
     WINDOW_NAME,
@@ -31,6 +30,9 @@ from settings import (
     WINDOW_NOT_FOUND_EXIT_DELAY,
 )
 import positions
+
+
+pytesseract.pytesseract.tesseract_cmd = str(TESSERACT_CMD)
 
 
 class WindowNotFoundError(ValueError):
