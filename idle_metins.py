@@ -1,3 +1,5 @@
+import pickle
+import re
 from pathlib import Path
 from time import perf_counter, sleep
 
@@ -14,8 +16,89 @@ from utils import channel_generator, setup_logger
 from vision_detector import VisionDetector
 
 
+_SAFE_GLOBALS_CACHE = set()
+_UNSUPPORTED_GLOBAL_RE = re.compile(r"Unsupported global: GLOBAL ([\\w\\.]+)")
+_ALLOWLIST_INITIALIZED = False
+
+
+def _register_safe_globals(globals_iterable):
+    """Register objects with torch's safe globals cache, caching duplicates locally."""
+
+    try:
+        from torch.serialization import add_safe_globals
+    except ImportError:  # pragma: no cover - torch not available in minimal setups
+        return set()
+
+    new_globals = {item for item in globals_iterable if item not in _SAFE_GLOBALS_CACHE}
+    if not new_globals:
+        return set()
+
+    add_safe_globals(list(new_globals))
+    _SAFE_GLOBALS_CACHE.update(new_globals)
+    return new_globals
+
+
+def _resolve_qualified_name(qualified_name):
+    """Resolve a dotted path to the referenced Python object."""
+
+    import importlib
+
+    parts = qualified_name.split(".")
+    for idx in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:idx])
+        attr_parts = parts[idx:]
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+
+        target = module
+        try:
+            for attr_name in attr_parts:
+                target = getattr(target, attr_name)
+        except AttributeError:
+            continue
+
+        return target
+
+    raise ImportError(f"Unable to resolve qualified name: {qualified_name}")
+
+
+def _allowlist_global_by_name(qualified_name):
+    """Allowlist a single serialization global identified by dotted path."""
+
+    try:
+        target = _resolve_qualified_name(qualified_name)
+    except Exception as exc:  # pragma: no cover - dependent on environment specific modules
+        logger.debug("Failed to resolve %s for safe serialization: %s", qualified_name, exc)
+        return False
+
+    _register_safe_globals([target])
+    return True
+
+
+def _allowlist_missing_global_from_error(error):
+    """Parse torch's error message and dynamically allowlist missing globals."""
+
+    match = _UNSUPPORTED_GLOBAL_RE.search(str(error))
+    if not match:
+        return False
+
+    qualified_name = match.group(1)
+    if _allowlist_global_by_name(qualified_name):
+        logger.debug("Allowlisted serialization global from error: %s", qualified_name)
+        return True
+
+    return False
+
+
 def _allowlist_ultralytics_serialization_types():
     """Allow torch.load(weights_only=True) to deserialize Ultralytics + torch.nn modules."""
+
+    global _ALLOWLIST_INITIALIZED
+
+    if _ALLOWLIST_INITIALIZED:
+        return
 
     try:
         from torch.serialization import add_safe_globals
@@ -101,7 +184,35 @@ def _allowlist_ultralytics_serialization_types():
         yolo_utils = None
     register_package_types(yolo_utils, "ultralytics.utils")
 
-    add_safe_globals(list(safe_types))
+    if safe_types:
+        _register_safe_globals(safe_types)
+
+    _ALLOWLIST_INITIALIZED = True
+
+
+def _load_yolo_model(weights_path, device):
+    """Load a YOLO model with automatic torch serialization allowlisting retries."""
+
+    _allowlist_ultralytics_serialization_types()
+
+    max_attempts = 5
+    attempt = 0
+
+    while True:
+        try:
+            model = YOLO(weights_path)
+            model.to(device)
+            return model
+        except pickle.UnpicklingError as exc:
+            attempt += 1
+            if attempt > max_attempts or not _allowlist_missing_global_from_error(exc):
+                raise
+
+            logger.debug(
+                "Retrying YOLO load after registering missing serialization global (%s/%s)",
+                attempt,
+                max_attempts,
+            )
 
 
 @click.command()
@@ -122,8 +233,7 @@ def main(event, log_level, start, saved_credentials_idx):
 
 
 def run(event, log_level, start, saved_credentials_idx):
-    _allowlist_ultralytics_serialization_types()
-    yolo = YOLO(MODELS_DIR / "valium_idle_metiny_yolov8s.pt").to("cuda:0")
+    yolo = _load_yolo_model(MODELS_DIR / "valium_idle_metiny_yolov8s.pt", device="cuda:0")
     yolo_verbose = log_level in ["TRACE", "DEBUG"]
     logger.info("YOLO model loaded.")
 
