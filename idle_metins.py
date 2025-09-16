@@ -31,7 +31,17 @@ def main(event, log_level, start, saved_credentials_idx):
     run(event, log_level, start, saved_credentials_idx)
 
 
-def run(event, log_level, start, saved_credentials_idx):
+def run(
+    event,
+    log_level,
+    start,
+    saved_credentials_idx,
+    yolo_confidence_threshold: float = 0.75,
+    channel_timeout: float = 20.0,
+    walk_to_metin_time: float = 1.25,
+    metin_destroy_time: float = 1.0,
+    looking_around_move_camera_press_time: float = 0.5,
+):
     yolo = YOLO(MODELS_DIR / "valium_idle_metiny_yolov8s.pt").to("cuda:0")
     yolo_verbose = log_level in ["TRACE", "DEBUG"]
     logger.info("YOLO model loaded.")
@@ -44,16 +54,16 @@ def run(event, log_level, start, saved_credentials_idx):
 
     channel_gen = channel_generator(1, 8, start=start, step=3 if event else 1)
 
-    YOLO_CONFIDENCE_THRESHOLD = 0.75
-    CHANNEL_TIMEOUT = 20
-    LOOKING_AROUND_MOVE_CAMERA_PRESS_TIME = 0.5
-    WALK_TO_METIN_TIME = 1.25
+    YOLO_CONFIDENCE_THRESHOLD = float(yolo_confidence_threshold)
+    CHANNEL_TIMEOUT = float(channel_timeout)
+    LOOKING_AROUND_MOVE_CAMERA_PRESS_TIME = float(looking_around_move_camera_press_time)
+    WALK_TO_METIN_TIME = float(walk_to_metin_time)
 
     # METIN_CLS = 0  # smierci sohan
     # METIN_DESTROY_TIME = 8  # smierci sohan | poly + masne eq + IS
 
     METIN_CLS = 1  # upadku polana
-    METIN_DESTROY_TIME = 1  # upadku polana | poly + masne eq + IS
+    METIN_DESTROY_TIME = float(metin_destroy_time)  # upadku polana | poly + masne eq + IS
 
     assert isinstance(METIN_CLS, int), "METIN_CLS must be an integer."
 

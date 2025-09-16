@@ -3,7 +3,7 @@ from datetime import timedelta
 from pathlib import Path
 from random import choice
 from time import perf_counter, sleep
-from typing import Tuple
+from typing import Sequence, Tuple
 from warnings import filterwarnings
 
 import click
@@ -62,7 +62,46 @@ def main(stage, log_level, saved_credentials_idx):
     run(stage, log_level, saved_credentials_idx)
 
 
-def run(stage, log_level, saved_credentials_idx):
+def _parse_stage_timeouts(stage_timeouts: Sequence[float] | str) -> Tuple[float, ...]:
+    """Validate and normalize stage timeout configuration."""
+
+    if isinstance(stage_timeouts, str):
+        raw = stage_timeouts.replace(";", ",").replace("\n", ",")
+        items = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        items = [str(item) for item in stage_timeouts]
+
+    if len(items) != 6:
+        raise ValueError(
+            "stage_timeouts must contain exactly 6 wartości rozdzielonych przecinkiem (po jednej na każdy etap)."
+        )
+
+    try:
+        parsed = tuple(float(item) for item in items)
+    except ValueError as exc:
+        raise ValueError(
+            "Nie udało się sparsować stage_timeouts – upewnij się, że podajesz tylko liczby." \
+        ) from exc
+
+    return parsed
+
+
+def run(
+    stage,
+    log_level,
+    saved_credentials_idx,
+    yolo_confidence_threshold: float = 0.7,
+    yolo_metin_confidence_threshold: float = 0.8,
+    nonsense_msg_similarity_threshold: float = 0.0,
+    stage_timeouts: Sequence[float] | str = (60, 120, 120, 300, 180, 420),
+    walk_time_to_metin: float = 10.0,
+    metin_destroy_time: float = 11.0,
+    loading_timeout: float = 10.0,
+    stage_200_mobs_idle_time: float = 16.0,
+    stage_item_drop_idle_time: float = 16.0,
+    stage_boss_walk_time: float = 3.0,
+    reenter_wait: float = 2.0,
+):
     yolo_checks()
     yolo_verbose = log_level in ["TRACE", "DEBUG"]
     yolo = YOLO(MODELS_DIR / "valium_polana_yolov8s.pt").to("cuda:0")
@@ -76,27 +115,26 @@ def run(stage, log_level, saved_credentials_idx):
 
     game.hide_minimap()
 
-    REENTER_WAIT = 2
-    YOLO_CONFIDENCE_THRESHOLD = 0.7
-    YOLO_METIN_CONFIDENCE_THRESHOLD = 0.8
-    NONSENSE_MSG_SIMILARITY_THRESHOLD = 0
-    STAGE_NAMES = ["before_enter", "stage_200_mobs", "stage_minibosses", "stage_metins", "stage_item_drop", "stage_boss"]
-    STAGE_TIMEOUT = [
-        60,       # before_enter
-        60 * 2,   # stage_200_mobs
-        60 * 2,   # stage_minibosses
-        60 * 5,   # stage_metins
-        60 * 3,   # stage_item_drop
-        60 * 7,   # stage_boss
+    STAGE_NAMES = [
+        "before_enter",
+        "stage_200_mobs",
+        "stage_minibosses",
+        "stage_metins",
+        "stage_item_drop",
+        "stage_boss",
     ]
+    STAGE_TIMEOUT = list(_parse_stage_timeouts(stage_timeouts))
 
-    WALK_TIME_TO_METIN = 10
-    METIN_DESTROY_TIME = 11
-
-    LOADING_TIMEOUT = 10
-    STAGE_200_MOBS_IDLE_TIME = 16
-    STAGE_ITEM_DROP_IDLE_TIME = 16
-    STAGE_BOSS_WALK_TIME = 3
+    YOLO_CONFIDENCE_THRESHOLD = float(yolo_confidence_threshold)
+    YOLO_METIN_CONFIDENCE_THRESHOLD = float(yolo_metin_confidence_threshold)
+    NONSENSE_MSG_SIMILARITY_THRESHOLD = float(nonsense_msg_similarity_threshold)
+    WALK_TIME_TO_METIN = float(walk_time_to_metin)
+    METIN_DESTROY_TIME = float(metin_destroy_time)
+    LOADING_TIMEOUT = float(loading_timeout)
+    STAGE_200_MOBS_IDLE_TIME = float(stage_200_mobs_idle_time)
+    STAGE_ITEM_DROP_IDLE_TIME = float(stage_item_drop_idle_time)
+    STAGE_BOSS_WALK_TIME = float(stage_boss_walk_time)
+    REENTER_WAIT = float(reenter_wait)
 
     BOSS_CLS = 0
     METIN_CLS = 1
