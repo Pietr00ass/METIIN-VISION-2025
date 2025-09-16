@@ -17,7 +17,7 @@ import dung_polana
 import fishbot
 import idle_metins
 import settings
-from settings import GameBind, UserBind
+from settings import BotBind, GameBind, UserBind
 from utils import setup_logger
 
 
@@ -295,7 +295,11 @@ class SettingsPanel(QtWidgets.QWidget):
         general_group.setLayout(general_form)
         layout.addWidget(general_group)
 
-        for enum_cls, title in ((GameBind, "GameBind"), (UserBind, "UserBind")):
+        for enum_cls, title in (
+            (GameBind, "GameBind"),
+            (UserBind, "UserBind"),
+            (BotBind, "BotBind"),
+        ):
             group = QtWidgets.QGroupBox(f"Bindy {title}")
             table = QtWidgets.QTableWidget(len(list(enum_cls)), 2)
             table.setHorizontalHeaderLabels(["Akcja", "Wartość"])
