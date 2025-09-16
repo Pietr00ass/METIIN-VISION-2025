@@ -6,7 +6,7 @@ import json
 import sys
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional
 
 from loguru import logger
@@ -205,6 +205,58 @@ class BotControlWidget(QtWidgets.QGroupBox):
         self.status_label.setText(text)
 
 
+class PathInput(QtWidgets.QWidget):
+    """Composite widget allowing to edit and browse filesystem paths."""
+
+    def __init__(
+        self,
+        initial: PurePath | str,
+        select_directory: bool,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._select_directory = select_directory
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._line_edit = QtWidgets.QLineEdit(str(initial))
+        browse_button = QtWidgets.QPushButton("Przeglądaj…")
+        browse_button.clicked.connect(self._browse)
+
+        layout.addWidget(self._line_edit)
+        layout.addWidget(browse_button)
+
+    def text(self) -> str:
+        return self._line_edit.text()
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt naming convention)
+        self._line_edit.setText(text)
+
+    def _browse(self) -> None:
+        current_text = self._line_edit.text()
+        start_path = current_text if current_text else str(Path.cwd())
+
+        if self._select_directory:
+            directory = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Wybierz folder",
+                start_path,
+            )
+            if directory:
+                self._line_edit.setText(directory)
+            return
+
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Wybierz plik",
+            start_path,
+            "Wszystkie pliki (*)",
+        )
+        if file_path:
+            self._line_edit.setText(file_path)
+
+
 class SettingsPanel(QtWidgets.QWidget):
     """Panel for editing values defined in :mod:`settings`."""
 
@@ -226,11 +278,13 @@ class SettingsPanel(QtWidgets.QWidget):
             if not name.isupper():
                 continue
             value = getattr(settings, name)
-            if isinstance(value, (int, float, str, bool)):
+            if isinstance(value, (int, float, str, bool, PurePath)):
                 widget: QtWidgets.QWidget
                 if isinstance(value, bool):
                     checkbox = QtWidgets.QCheckBox()
                     widget = checkbox
+                elif isinstance(value, PurePath):
+                    widget = PathInput(value, self._is_directory_path(name, value))
                 else:
                     line_edit = QtWidgets.QLineEdit()
                     widget = line_edit
@@ -281,6 +335,8 @@ class SettingsPanel(QtWidgets.QWidget):
             value = getattr(settings, name)
             if isinstance(widget, QtWidgets.QCheckBox):
                 widget.setChecked(bool(value))
+            elif isinstance(widget, PathInput):
+                widget.setText(str(value))
             elif isinstance(widget, QtWidgets.QLineEdit):
                 widget.setText(str(value))
 
@@ -301,6 +357,7 @@ class SettingsPanel(QtWidgets.QWidget):
 
         for name, value in scalar_values.items():
             setattr(settings, name, value)
+            self.scalar_types[name] = type(value)
 
         for enum_name, values in enum_values.items():
             enum_cls = getattr(settings, enum_name)
@@ -319,7 +376,10 @@ class SettingsPanel(QtWidgets.QWidget):
             return
 
         data = {
-            "scalars": scalar_values,
+            "scalars": {
+                name: str(value) if isinstance(value, PurePath) else value
+                for name, value in scalar_values.items()
+            },
             "enums": {
                 enum_name: {
                     member: self._serialize_enum_value(value)
@@ -347,7 +407,12 @@ class SettingsPanel(QtWidgets.QWidget):
             enums = data.get("enums", {})
             for name, value in scalars.items():
                 if name in self.scalar_inputs:
-                    setattr(settings, name, value)
+                    value_type = self.scalar_types.get(name)
+                    if isinstance(value_type, type) and issubclass(value_type, PurePath):
+                        setattr(settings, name, Path(str(value)))
+                    else:
+                        setattr(settings, name, value)
+                    self.scalar_types[name] = type(getattr(settings, name))
 
             for enum_name, members in enums.items():
                 if enum_name in self.enum_tables:
@@ -370,8 +435,13 @@ class SettingsPanel(QtWidgets.QWidget):
                 values[name] = bool(widget.isChecked())
                 continue
 
-            assert isinstance(widget, QtWidgets.QLineEdit)
-            text = widget.text().strip()
+            if isinstance(widget, PathInput):
+                raw_text = widget.text()
+                text = raw_text.strip()
+            else:
+                assert isinstance(widget, QtWidgets.QLineEdit)
+                raw_text = widget.text()
+                text = raw_text.strip()
             try:
                 if value_type is int:
                     values[name] = int(text)
@@ -379,11 +449,23 @@ class SettingsPanel(QtWidgets.QWidget):
                     values[name] = float(text)
                 elif value_type is bool:
                     values[name] = text.lower() in {"1", "true", "tak", "yes"}
+                elif isinstance(value_type, type) and issubclass(value_type, PurePath):
+                    if not text:
+                        raise ValueError(f"Ścieżka dla {name} nie może być pusta.")
+                    values[name] = Path(raw_text)
                 else:
                     values[name] = text
             except ValueError as exc:
                 raise ValueError(f"Niepoprawna wartość dla {name}: '{text}'.") from exc
         return values
+
+    def _is_directory_path(self, name: str, path_value: PurePath) -> bool:
+        upper_name = name.upper()
+        if upper_name.endswith(("_DIR", "_DIRS")):
+            return True
+        if upper_name.endswith(("_FILE", "_PATH", "_FPATH")):
+            return False
+        return path_value.suffix == ""
 
     def _collect_enum_values(self) -> Dict[str, Dict[str, Any]]:
         values: Dict[str, Dict[str, Any]] = {}
