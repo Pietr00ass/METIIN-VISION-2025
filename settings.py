@@ -11,6 +11,9 @@ METINS_DIR = TARGET_TEMPLATES_DIR / "metins"
 MODELS_DIR = PurePath("models")
 DATASETS_DIR = DATA_DIR / "datasets"
 
+TESSERACT_CMD = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+GAME_EXE_PATH = Path(r"C:\BOT\ValiumAkademia\valium.exe")
+
 
 class GameBind(Enum):
     ATTACK = Key.space

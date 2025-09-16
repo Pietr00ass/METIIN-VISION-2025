@@ -465,6 +465,8 @@ class SettingsPanel(QtWidgets.QWidget):
 
     def _is_directory_path(self, name: str, path_value: PurePath) -> bool:
         upper_name = name.upper()
+        if upper_name.endswith("_CMD"):
+            return False
         if upper_name.endswith(("_DIR", "_DIRS")):
             return True
         if upper_name.endswith(("_FILE", "_PATH", "_FPATH")):
