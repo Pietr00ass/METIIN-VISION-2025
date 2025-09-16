@@ -14,6 +14,72 @@ from utils import channel_generator, setup_logger
 from vision_detector import VisionDetector
 
 
+def _allowlist_ultralytics_serialization_types():
+    """Ensure custom Ultralytics modules can be deserialized with torch.load(weights_only=True)."""
+
+    try:
+        from torch.serialization import add_safe_globals
+    except ImportError:  # pragma: no cover - fallback for very old torch versions
+        return
+
+    safe_types = set()
+
+    try:
+        from torch.nn.modules.container import Sequential
+
+        safe_types.add(Sequential)
+    except ImportError:  # pragma: no cover - defensive; Sequential is available in torch
+        pass
+
+    try:
+        from ultralytics.nn.tasks import DetectionModel
+
+        safe_types.add(DetectionModel)
+    except ImportError:
+        # Ultralytics not installed or module layout changed; nothing more to allowlist.
+        add_safe_globals(list(safe_types))
+        return
+
+    try:
+        import importlib
+        import inspect
+        import pkgutil
+        from types import ModuleType
+
+        from ultralytics.nn import modules as yolo_modules
+    except ImportError:
+        add_safe_globals(list(safe_types))
+        return
+
+    visited_modules = set()
+
+    def register_module(module):
+        if module in visited_modules:
+            return
+        visited_modules.add(module)
+
+        for attr in vars(module).values():
+            if inspect.isclass(attr):
+                safe_types.add(attr)
+            elif isinstance(attr, ModuleType) and getattr(attr, "__package__", "").startswith("ultralytics.nn"):
+                register_module(attr)
+
+    register_module(yolo_modules)
+
+    if hasattr(yolo_modules, "__path__"):
+        prefix = yolo_modules.__name__ + "."
+        for module_info in pkgutil.walk_packages(yolo_modules.__path__, prefix):
+            try:
+                submodule = importlib.import_module(module_info.name)
+            except Exception as exc:  # pragma: no cover - best effort: skip problematic modules
+                logger.debug(f"Failed to import {module_info.name} while registering safe globals: {exc}")
+                continue
+
+            register_module(submodule)
+
+    add_safe_globals(list(safe_types))
+
+
 @click.command()
 @click.option("--event", is_flag=True, help="Enable event mode (+2 metins)")
 @click.option("--log-level",
@@ -32,11 +98,7 @@ def main(event, log_level, start, saved_credentials_idx):
 
 
 def run(event, log_level, start, saved_credentials_idx):
-    from torch.serialization import add_safe_globals
-    from torch.nn.modules.container import Sequential
-    from ultralytics.nn.tasks import DetectionModel
-
-    add_safe_globals([DetectionModel, Sequential])
+    _allowlist_ultralytics_serialization_types()
     yolo = YOLO(MODELS_DIR / "valium_idle_metiny_yolov8s.pt").to("cuda:0")
     yolo_verbose = log_level in ["TRACE", "DEBUG"]
     logger.info("YOLO model loaded.")
