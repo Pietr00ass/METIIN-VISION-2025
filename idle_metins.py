@@ -15,14 +15,53 @@ from vision_detector import VisionDetector
 
 
 def _allowlist_ultralytics_serialization_types():
-    """Ensure custom Ultralytics modules can be deserialized with torch.load(weights_only=True)."""
+    """Allow torch.load(weights_only=True) to deserialize Ultralytics + torch.nn modules."""
 
     try:
         from torch.serialization import add_safe_globals
     except ImportError:  # pragma: no cover - fallback for very old torch versions
         return
 
+    import importlib
+    import inspect
+    import pkgutil
+    from types import ModuleType
+
     safe_types = set()
+
+    def register_package_types(root_module, package_prefix):
+        if root_module is None:
+            return
+
+        visited_modules = set()
+
+        def register(module):
+            if module in visited_modules:
+                return
+            visited_modules.add(module)
+
+            for attr in vars(module).values():
+                if inspect.isclass(attr):
+                    safe_types.add(attr)
+                elif isinstance(attr, ModuleType):
+                    module_name = getattr(attr, "__name__", "")
+                    if module_name.startswith(package_prefix):
+                        register(attr)
+
+        register(root_module)
+
+        if hasattr(root_module, "__path__"):
+            prefix = root_module.__name__ + "."
+            for module_info in pkgutil.walk_packages(root_module.__path__, prefix):
+                try:
+                    submodule = importlib.import_module(module_info.name)
+                except Exception as exc:  # pragma: no cover - best effort: skip problematic modules
+                    logger.debug(
+                        f"Failed to import {module_info.name} while registering safe globals: {exc}"
+                    )
+                    continue
+
+                register(submodule)
 
     try:
         from torch.nn.modules.container import Sequential
@@ -32,50 +71,35 @@ def _allowlist_ultralytics_serialization_types():
         pass
 
     try:
+        from torch.nn import modules as torch_nn_modules
+    except ImportError:  # pragma: no cover - defensive: torch should always provide nn.modules
+        torch_nn_modules = None
+    register_package_types(torch_nn_modules, "torch.nn.modules")
+
+    try:
         from ultralytics.nn.tasks import DetectionModel
 
         safe_types.add(DetectionModel)
-    except ImportError:
-        # Ultralytics not installed or module layout changed; nothing more to allowlist.
-        add_safe_globals(list(safe_types))
-        return
+    except ImportError:  # pragma: no cover - ultralytics not installed
+        pass
 
     try:
-        import importlib
-        import inspect
-        import pkgutil
-        from types import ModuleType
-
         from ultralytics.nn import modules as yolo_modules
-    except ImportError:
-        add_safe_globals(list(safe_types))
-        return
+    except ImportError:  # pragma: no cover - ultralytics not installed
+        yolo_modules = None
+    register_package_types(yolo_modules, "ultralytics.nn")
 
-    visited_modules = set()
+    try:
+        from ultralytics.nn import tasks as yolo_tasks
+    except ImportError:  # pragma: no cover - ultralytics not installed
+        yolo_tasks = None
+    register_package_types(yolo_tasks, "ultralytics.nn")
 
-    def register_module(module):
-        if module in visited_modules:
-            return
-        visited_modules.add(module)
-
-        for attr in vars(module).values():
-            if inspect.isclass(attr):
-                safe_types.add(attr)
-            elif isinstance(attr, ModuleType) and getattr(attr, "__package__", "").startswith("ultralytics.nn"):
-                register_module(attr)
-
-    register_module(yolo_modules)
-
-    if hasattr(yolo_modules, "__path__"):
-        prefix = yolo_modules.__name__ + "."
-        for module_info in pkgutil.walk_packages(yolo_modules.__path__, prefix):
-            try:
-                submodule = importlib.import_module(module_info.name)
-            except Exception as exc:  # pragma: no cover - best effort: skip problematic modules
-                logger.debug(f"Failed to import {module_info.name} while registering safe globals: {exc}")
-                continue
-
-            register_module(submodule)
+    try:
+        from ultralytics import utils as yolo_utils
+    except ImportError:  # pragma: no cover - ultralytics not installed
+        yolo_utils = None
+    register_package_types(yolo_utils, "ultralytics.utils")
 
     add_safe_globals(list(safe_types))
 
