@@ -3,7 +3,7 @@ from datetime import timedelta
 from pathlib import Path
 from random import choice
 from time import perf_counter, sleep
-from typing import Tuple
+from typing import Sequence, Tuple
 from warnings import filterwarnings
 
 import click
@@ -46,24 +46,63 @@ def main(stage, log_level, saved_credentials_idx):
     run(stage, log_level, saved_credentials_idx)
 
 
-def run(stage, log_level, saved_credentials_idx):
+def _parse_window(window: Sequence[int] | str) -> Tuple[int, int, int, int]:
+    """Parse window specification into (top, bottom, left, right)."""
+
+    if isinstance(window, str):
+        normalized = window.replace(" ", "")
+        normalized = normalized.replace(";", ",")
+        normalized = normalized.replace(":", ",")
+        parts = [part for part in normalized.split(",") if part]
+        if len(parts) != 4:
+            raise ValueError(
+                "Parametr fishing_window musi zawierać cztery wartości: górę, dół, lewą i prawą krawędź w pikselach."
+            )
+        try:
+            top, bottom, left, right = map(int, parts)
+        except ValueError as exc:
+            raise ValueError(
+                "Nie udało się sparsować fishing_window – wpisz liczby całkowite oddzielone przecinkami."
+            ) from exc
+    else:
+        if len(tuple(window)) != 4:
+            raise ValueError("fishing_window musi mieć cztery elementy.")
+        top, bottom, left, right = map(int, window)
+
+    if bottom <= top:
+        raise ValueError("Dolna krawędź musi być większa od górnej w parametrze fishing_window.")
+    if right <= left:
+        raise ValueError("Prawa krawędź musi być większa od lewej w parametrze fishing_window.")
+
+    return top, bottom, left, right
+
+
+def run(
+    stage,
+    log_level,
+    saved_credentials_idx,
+    yolo_confidence_threshold: float = 0.95,
+    fishing_window: Sequence[int] | str = (77, 304, 101, 379),
+):
     yolo_checks()
     yolo_verbose = log_level in ["TRACE", "DEBUG"]
     yolo = YOLO(MODELS_DIR / "global_fishbot_yolov8s.pt").to("cuda:0")
 
     vision = VisionDetector()
-    game = GameController(vision_detector=vision, start_delay=2)
+    game = GameController(vision_detector=vision, start_delay=2, saved_credentials_idx=saved_credentials_idx)
 
-    YOLO_CONFIDENCE_THRESHOLD = 0.95
+    YOLO_CONFIDENCE_THRESHOLD = float(yolo_confidence_threshold)
     FISH_CLS = 0
+
+    top, bottom, left, right = _parse_window(fishing_window)
 
     while game.is_running:
         frame = vision.capture_frame()
 
-        fishing_window = frame[77:304, 101:379]
+        fishing_view = frame[top:bottom, left:right]
 
         yolo_results = yolo.predict(
-            source=fishing_window, conf=YOLO_CONFIDENCE_THRESHOLD, verbose=yolo_verbose
+            source=fishing_view, conf=YOLO_CONFIDENCE_THRESHOLD, verbose=yolo_verbose
         )[0]
         fish_detected = len(yolo_results.boxes.cls) > 0
         logger.debug(f"{fish_detected=}")
@@ -76,7 +115,7 @@ def run(stage, log_level, saved_credentials_idx):
         fish_bbox_xywh = yolo_results.boxes.xywh[0]
         fish_bbox_center = fish_bbox_xywh[:2]
 
-        fish_bbox_center_fixed = fish_bbox_center.cpu() + np.array([77, 101])
+        fish_bbox_center_fixed = fish_bbox_center.cpu() + np.array([top, left])
 
         fish_bbox_center_global = vision.get_global_pos(fish_bbox_center_fixed)
 
