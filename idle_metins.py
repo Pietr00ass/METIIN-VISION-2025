@@ -33,9 +33,10 @@ def main(event, log_level, start, saved_credentials_idx):
 
 def run(event, log_level, start, saved_credentials_idx):
     from torch.serialization import add_safe_globals
+    from torch.nn.modules.container import Sequential
     from ultralytics.nn.tasks import DetectionModel
 
-    add_safe_globals([DetectionModel])
+    add_safe_globals([DetectionModel, Sequential])
     yolo = YOLO(MODELS_DIR / "valium_idle_metiny_yolov8s.pt").to("cuda:0")
     yolo_verbose = log_level in ["TRACE", "DEBUG"]
     logger.info("YOLO model loaded.")
