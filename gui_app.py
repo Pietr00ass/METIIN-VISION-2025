@@ -473,6 +473,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bot_runners: Dict[str, BotRunner] = {}
         self.bot_controls: Dict[str, BotControlWidget] = {}
         self.active_bot: Optional[str] = None
+        self.log_messages: List[str] = []
+        self.log_filter_edit: Optional[QtWidgets.QLineEdit] = None
+        self.autoscroll_checkbox: Optional[QtWidgets.QCheckBox] = None
+        self.log_count_label: Optional[QtWidgets.QLabel] = None
+        self.log_view: Optional[QtWidgets.QPlainTextEdit] = None
 
         self._setup_ui()
 
@@ -483,9 +488,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_panel = SettingsPanel()
         tabs.addTab(self.settings_panel, "Ustawienia")
 
-        self.log_view = QtWidgets.QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        tabs.addTab(self.log_view, "Logi")
+        tabs.addTab(self._create_logs_tab(), "Logi")
 
         self.setCentralWidget(tabs)
 
@@ -514,6 +517,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout.addStretch(1)
         widget.setLayout(layout)
+        return widget
+
+    def _create_logs_tab(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        controls_layout = QtWidgets.QHBoxLayout()
+
+        filter_label = QtWidgets.QLabel("Filtr:")
+        controls_layout.addWidget(filter_label)
+
+        self.log_filter_edit = QtWidgets.QLineEdit()
+        self.log_filter_edit.setPlaceholderText("Wpisz fragment tekstu, aby przefiltrować logi")
+        self.log_filter_edit.textChanged.connect(self._refresh_log_view)
+        controls_layout.addWidget(self.log_filter_edit)
+
+        self.autoscroll_checkbox = QtWidgets.QCheckBox("Autoprzewijanie")
+        self.autoscroll_checkbox.setChecked(True)
+        controls_layout.addWidget(self.autoscroll_checkbox)
+
+        clear_button = QtWidgets.QPushButton("Wyczyść")
+        clear_button.clicked.connect(self._clear_logs)
+        controls_layout.addWidget(clear_button)
+
+        save_button = QtWidgets.QPushButton("Zapisz do pliku")
+        save_button.clicked.connect(self._save_logs)
+        controls_layout.addWidget(save_button)
+
+        self.log_count_label = QtWidgets.QLabel("Wpisy: 0")
+        controls_layout.addWidget(self.log_count_label)
+
+        controls_layout.addStretch(1)
+
+        layout.addLayout(controls_layout)
+
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view)
+
+        widget.setLayout(layout)
+        self._refresh_log_view()
         return widget
 
     def _create_bot_configs(self) -> List[BotConfig]:
@@ -667,9 +711,76 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str)
     def _append_log(self, message: str) -> None:
-        self.log_view.appendPlainText(message)
-        self.log_view.verticalScrollBar().setValue(
-            self.log_view.verticalScrollBar().maximum()
+        self.log_messages.append(message)
+        self._refresh_log_view()
+
+    def _filtered_messages(self) -> List[str]:
+        if not self.log_filter_edit:
+            return list(self.log_messages)
+
+        filter_text = self.log_filter_edit.text().strip().lower()
+        if not filter_text:
+            return list(self.log_messages)
+        return [msg for msg in self.log_messages if filter_text in msg.lower()]
+
+    def _refresh_log_view(self) -> None:
+        if not self.log_view:
+            return
+
+        scrollbar = self.log_view.verticalScrollBar()
+        previous_value = scrollbar.value()
+        filtered = self._filtered_messages()
+        self.log_view.setPlainText("\n".join(filtered))
+
+        if self.log_count_label:
+            total = len(self.log_messages)
+            filtered_count = len(filtered)
+            self.log_count_label.setText(f"Wpisy: {filtered_count} / {total}")
+
+        if self.autoscroll_checkbox and self.autoscroll_checkbox.isChecked():
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(previous_value)
+
+    def _clear_logs(self) -> None:
+        self.log_messages.clear()
+        self._refresh_log_view()
+
+    def _save_logs(self) -> None:
+        if not self.log_messages:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Brak danych",
+                "Brak logów do zapisania.",
+            )
+            return
+
+        filtered_messages = self._filtered_messages()
+        default_path = str(Path.cwd() / "logi.txt")
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Zapisz logi",
+            default_path,
+            "Pliki tekstowe (*.txt);;Wszystkie pliki (*)",
+        )
+
+        if not file_path:
+            return
+
+        try:
+            Path(file_path).write_text("\n".join(filtered_messages), encoding="utf-8")
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Błąd zapisu",
+                f"Nie udało się zapisać logów: {exc}",
+            )
+            return
+
+        QtWidgets.QMessageBox.information(
+            self,
+            "Zapisano",
+            f"Logi zostały zapisane do pliku: {file_path}",
         )
 
 
