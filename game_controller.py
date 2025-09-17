@@ -96,6 +96,7 @@ class GameController:
         self.minimap_visible = True
         self.map_visible = False
         self.settings_visible = False
+        self.teleport_panel_visible = False
 
         self._start_delay(self.start_delay)
         self._activate_window()
@@ -120,6 +121,7 @@ class GameController:
         self.minimap_visible = True
         self.map_visible = False
         self.settings_visible = False
+        self.teleport_panel_visible = False
 
     def _activate_window(self):
         # dummy function to activate the window by clicking on it in safe area
@@ -661,6 +663,50 @@ class GameController:
         logger.info("Showing the map...")
         if not self.map_visible:
             self.toggle_map()
+
+    def open_teleport_panel(self):
+        if self.teleport_panel_visible:
+            logger.debug("Teleport panel already open.")
+            return
+        logger.info("Opening teleport panel (F9)...")
+        self.tap_key(Key.f9, press_time=0.3)
+        sleep(0.5)
+        self.teleport_panel_visible = True
+
+    def close_teleport_panel(self):
+        if not self.teleport_panel_visible:
+            logger.debug("Teleport panel already closed.")
+            return
+        logger.debug("Closing teleport panel (F9)...")
+        self.tap_key(Key.f9, press_time=0.3)
+        sleep(0.3)
+        self.teleport_panel_visible = False
+
+    def teleport_to_position(
+        self,
+        index: int,
+        after_tp_wait: float = 10.0,
+        close_panel: bool = True,
+    ):
+        logger.info(f"Teleporting to preset {index}...")
+        try:
+            slot_center = positions.TELEPORT_PANEL_SLOT_CENTERS[index]
+        except KeyError as exc:
+            raise ValueError(f"Unknown teleport preset index: {index}") from exc
+
+        self.open_teleport_panel()
+        global_slot_center = self.vision_detector.get_global_pos(slot_center)
+        self.click_at(global_slot_center)
+
+        if close_panel:
+            self.close_teleport_panel()
+
+        logger.debug(
+            "Waiting for the teleportation to finish... (%ss)",
+            after_tp_wait,
+        )
+        sleep(after_tp_wait)
+        self.teleport_panel_visible = False
 
     def teleport_to_polana(self, after_tp_wait: float = 10):
         logger.info("Teleporting to Leśna Polana...")
