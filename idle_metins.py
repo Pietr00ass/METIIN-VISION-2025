@@ -46,6 +46,37 @@ def run(
     yolo_verbose = log_level in ["TRACE", "DEBUG"]
     logger.info("YOLO model loaded.")
 
+    raw_model_names = getattr(yolo.model, "names", getattr(yolo, "names", {}))
+    if isinstance(raw_model_names, dict):
+        name_to_id = {}
+        for cls_idx, cls_name in raw_model_names.items():
+            try:
+                name_to_id[cls_name] = int(cls_idx)
+            except (TypeError, ValueError):
+                logger.debug(f"Skipping non-integer YOLO class id: {cls_idx!r}")
+    elif isinstance(raw_model_names, list):
+        name_to_id = {cls_name: cls_idx for cls_idx, cls_name in enumerate(raw_model_names)}
+    else:
+        name_to_id = {}
+
+    metin_label_candidates = ("metin", "metin_cls")
+    METIN_CLS = None
+    selected_metin_label = None
+    for candidate in metin_label_candidates:
+        if candidate in name_to_id:
+            METIN_CLS = name_to_id[candidate]
+            selected_metin_label = candidate
+            break
+
+    if METIN_CLS is None:
+        available = ", ".join(sorted(name_to_id)) or "none"
+        raise ValueError(
+            "Unable to determine the YOLO class id for metins. "
+            f"Looked for labels {metin_label_candidates!r}, available labels: {available}"
+        )
+
+    logger.info(f"Using YOLO class '{selected_metin_label}' (id={METIN_CLS}) for metin detection.")
+
     vision = VisionDetector()
     logger.info("Vision detector loaded.")
 
@@ -59,10 +90,8 @@ def run(
     LOOKING_AROUND_MOVE_CAMERA_PRESS_TIME = float(looking_around_move_camera_press_time)
     WALK_TO_METIN_TIME = float(walk_to_metin_time)
 
-    # METIN_CLS = 0  # smierci sohan
     # METIN_DESTROY_TIME = 8  # smierci sohan | poly + masne eq + IS
 
-    METIN_CLS = 1  # upadku polana
     METIN_DESTROY_TIME = float(metin_destroy_time)  # upadku polana | poly + masne eq + IS
 
     assert isinstance(METIN_CLS, int), "METIN_CLS must be an integer."
