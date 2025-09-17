@@ -1,3 +1,4 @@
+from itertools import cycle
 from pathlib import Path
 from time import perf_counter, sleep
 
@@ -8,6 +9,7 @@ from torch import where as torch_where
 from ultralytics import YOLO
 from ultralytics import checks as yolo_checks
 
+from config_manager import DEFAULT_TELEPORT_SEQUENCE, load_teleport_sequence
 from game_controller import GameController, Key
 from settings import MODELS_DIR, UserBind
 from utils import channel_generator, setup_logger
@@ -85,6 +87,14 @@ def run(
 
     channel_gen = channel_generator(1, 8, start=start, step=3 if event else 1)
 
+    teleport_sequence = load_teleport_sequence()
+    if not teleport_sequence:
+        teleport_sequence = DEFAULT_TELEPORT_SEQUENCE.copy()
+    teleport_cycle = cycle(teleport_sequence)
+    channels_completed = 0
+    channels_per_cycle = len(DEFAULT_TELEPORT_SEQUENCE)
+    logger.info("Teleport sequence configured as: %s", teleport_sequence)
+
     YOLO_CONFIDENCE_THRESHOLD = float(yolo_confidence_threshold)
     CHANNEL_TIMEOUT = float(channel_timeout)
     LOOKING_AROUND_MOVE_CAMERA_PRESS_TIME = float(looking_around_move_camera_press_time)
@@ -106,6 +116,8 @@ def run(
 
     while game.is_running:
         channel = next(channel_gen)
+        channels_completed += 1
+        cycle_completed = channels_completed % channels_per_cycle == 0
         game.change_to_channel(channel, wait_after_change=1)
 
         t0 = perf_counter()
@@ -161,6 +173,16 @@ def run(
                 continue
         
         if timed_out and not metin_detected:
+            if cycle_completed:
+                teleport_slot = next(teleport_cycle)
+                logger.info(
+                    "Cycle of %s channels finished without metin. Teleporting to slot %s.",
+                    channels_per_cycle,
+                    teleport_slot,
+                )
+                game.teleport_to_position(teleport_slot)
+                game.calibrate_camera()
+                game.move_camera_down(press_time=0.7)
             continue
 
         metins_xywh = yolo_results.boxes.xywh[metins_idxs].cpu()
@@ -187,6 +209,17 @@ def run(
         if butelka_dywizji_filled:
             game.move_full_butelka_dywizji()
             game.use_next_butelka_dywizji()
+
+        if cycle_completed:
+            teleport_slot = next(teleport_cycle)
+            logger.info(
+                "Completed a full cycle of %s channels. Teleporting to slot %s.",
+                channels_per_cycle,
+                teleport_slot,
+            )
+            game.teleport_to_position(teleport_slot)
+            game.calibrate_camera()
+            game.move_camera_down(press_time=0.7)
 
 
 if __name__ == '__main__':
