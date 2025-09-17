@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -13,6 +12,13 @@ from loguru import logger
 from PyQt6 import QtCore, QtWidgets
 from pynput.keyboard import Key
 
+from config_manager import (
+    CONFIG_FILE,
+    DEFAULT_TELEPORT_SEQUENCE,
+    load_config,
+    load_teleport_sequence,
+    save_config,
+)
 import dung_polana
 import fishbot
 import idle_metins
@@ -21,7 +27,6 @@ from settings import BotBind, GameBind, UserBind
 from utils import setup_logger
 
 
-CONFIG_FILE = Path("config.json")
 LOG_FORMAT = "{time:HH:mm:ss} | {level:<8} | {message}"
 
 
@@ -468,6 +473,76 @@ class PathInput(QtWidgets.QWidget):
             self._line_edit.setText(file_path)
 
 
+class TeleportConfigWidget(QtWidgets.QWidget):
+    """Widget allowing to reorder and enable teleport slots."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._list = QtWidgets.QListWidget()
+        self._list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self._list.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self._list.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        description = QtWidgets.QLabel(
+            "Ułóż kolejność presetów teleportu (F9) metodą przeciągnij i upuść. "
+            "Odznaczenie pozycji spowoduje jej pominięcie w cyklu."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        layout.addWidget(self._list)
+        layout.addStretch(1)
+
+        self.reset_to_defaults()
+
+    def _create_item(self, index: int, checked: bool) -> QtWidgets.QListWidgetItem:
+        item = QtWidgets.QListWidgetItem(f"Pozycja {index}")
+        flags = item.flags()
+        flags |= QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        flags |= QtCore.Qt.ItemFlag.ItemIsDragEnabled
+        item.setFlags(flags)
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, index)
+        item.setCheckState(
+            QtCore.Qt.CheckState.Checked
+            if checked
+            else QtCore.Qt.CheckState.Unchecked
+        )
+        return item
+
+    def set_sequence(self, sequence: List[int]) -> None:
+        seen: set[int] = set()
+        ordered: List[int] = []
+        for index in sequence:
+            if not isinstance(index, int):
+                continue
+            if 1 <= index <= len(DEFAULT_TELEPORT_SEQUENCE) and index not in seen:
+                ordered.append(index)
+                seen.add(index)
+        remaining = [idx for idx in DEFAULT_TELEPORT_SEQUENCE if idx not in seen]
+
+        self._list.clear()
+        for index in ordered:
+            self._list.addItem(self._create_item(index, True))
+        for index in remaining:
+            self._list.addItem(self._create_item(index, False))
+
+    def sequence(self) -> List[int]:
+        selected: List[int] = []
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is None:
+                continue
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(value, int):
+                    selected.append(value)
+        if selected:
+            return selected
+        return DEFAULT_TELEPORT_SEQUENCE.copy()
+
+    def reset_to_defaults(self) -> None:
+        self.set_sequence(DEFAULT_TELEPORT_SEQUENCE)
+
 class SettingsPanel(QtWidgets.QWidget):
     """Panel for editing values defined in :mod:`settings`."""
 
@@ -590,15 +665,7 @@ class SettingsPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Błąd", str(exc))
             return
 
-        try:
-            existing = (
-                json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                if CONFIG_FILE.exists()
-                else {}
-            )
-        except json.JSONDecodeError as exc:
-            logger.warning("Plik %s zawiera niepoprawny JSON – tworzenie nowego pliku. (%s)", CONFIG_FILE, exc)
-            existing = {}
+        existing = load_config()
 
         existing["scalars"] = {
             name: str(value) if isinstance(value, PurePath) else value
@@ -613,10 +680,7 @@ class SettingsPanel(QtWidgets.QWidget):
         }
 
         try:
-            CONFIG_FILE.write_text(
-                json.dumps(existing, indent=4, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            save_config(existing)
         except OSError as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -636,7 +700,7 @@ class SettingsPanel(QtWidgets.QWidget):
             )
             return
 
-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        data = load_config()
         try:
             scalars = data.get("scalars", {})
             enums = data.get("enums", {})
@@ -788,6 +852,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_handler.log_signal.connect(self._append_log)
         logger.add(self.log_handler.emit, format=LOG_FORMAT, level="TRACE", enqueue=True)
 
+        self.config_data: Dict[str, Any] = {}
+        self.teleport_config: Dict[str, Any] = {}
         self.gui_config: Dict[str, Any] = self._load_gui_config()
         self.bot_configs = self._create_bot_configs()
         self.bot_runners: Dict[str, BotRunner] = {}
@@ -798,12 +864,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autoscroll_checkbox: Optional[QtWidgets.QCheckBox] = None
         self.log_count_label: Optional[QtWidgets.QLabel] = None
         self.log_view: Optional[QtWidgets.QPlainTextEdit] = None
+        self.teleport_widget: Optional[TeleportConfigWidget] = None
 
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self._create_bots_tab(), "Tryby")
+
+        self.teleport_widget = TeleportConfigWidget()
+        initial_sequence = load_teleport_sequence(self.config_data)
+        self.teleport_widget.set_sequence(initial_sequence)
+        tabs.addTab(self.teleport_widget, "Teleporty")
 
         self.settings_panel = SettingsPanel()
         tabs.addTab(self.settings_panel, "Ustawienia")
@@ -1339,19 +1411,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _load_gui_config(self) -> Dict[str, Any]:
-        if not CONFIG_FILE.exists():
-            return {}
+        self.config_data = load_config()
 
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            logger.warning("Nie udało się wczytać konfiguracji GUI: {}", exc)
-            return {}
+        gui_data = self.config_data.get("gui", {})
+        if not isinstance(gui_data, dict):
+            gui_data = {}
 
-        gui_data = data.get("gui", {})
-        if isinstance(gui_data, dict):
-            return gui_data
-        return {}
+        teleport_data = self.config_data.get("teleport", {})
+        if isinstance(teleport_data, dict):
+            self.teleport_config = teleport_data
+        else:
+            self.teleport_config = {}
+
+        return gui_data
 
     def _collect_gui_config(self) -> Dict[str, Any]:
         collected: Dict[str, Any] = {}
@@ -1363,24 +1435,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _save_gui_config(self) -> None:
         gui_data = self._collect_gui_config()
+        teleport_sequence = (
+            self.teleport_widget.sequence()
+            if self.teleport_widget is not None
+            else DEFAULT_TELEPORT_SEQUENCE.copy()
+        )
+        teleport_data = {"sequence": teleport_sequence}
 
-        try:
-            existing = (
-                json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                if CONFIG_FILE.exists()
-                else {}
-            )
-        except json.JSONDecodeError as exc:
-            logger.warning("Plik %s zawiera niepoprawny JSON – tworzenie nowego pliku. (%s)", CONFIG_FILE, exc)
-            existing = {}
-
+        existing = load_config()
         existing["gui"] = gui_data
+        existing["teleport"] = teleport_data
 
         try:
-            CONFIG_FILE.write_text(
-                json.dumps(existing, indent=4, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            save_config(existing)
         except OSError as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -1389,7 +1456,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
+        self.config_data = existing
         self.gui_config = gui_data
+        self.teleport_config = teleport_data
         logger.success("Zapisano konfigurację GUI do pliku %s.", CONFIG_FILE)
         QtWidgets.QMessageBox.information(
             self,
@@ -1401,7 +1470,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for control in self.bot_controls.values():
             control.reset_to_defaults()
 
+        if self.teleport_widget is not None:
+            self.teleport_widget.reset_to_defaults()
+
         self.gui_config = {}
+        self.teleport_config = {}
         logger.info("Przywrócono domyślne ustawienia GUI w bieżącej sesji.")
         QtWidgets.QMessageBox.information(
             self,

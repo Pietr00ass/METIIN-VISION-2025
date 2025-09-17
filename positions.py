@@ -25,6 +25,18 @@ LOAD_CREDENTIAL_BTN_SPACING = 40
 # map (tab)
 MAP_POLANA_BTN_CENTER = (460, 437)
 
+# teleport panel (F9)
+TELEPORT_PANEL_SLOT_CENTERS = {
+    1: (310, 210),
+    2: (375, 210),
+    3: (440, 210),
+    4: (505, 210),
+    5: (310, 275),
+    6: (375, 275),
+    7: (440, 275),
+    8: (505, 275),
+}
+
 # settings buttons
 GAME_SYS_SETTINGS_BTN_CENTER = (400, 240)
 GSS_CAM_CLOSER_BTN_CENTER = (395, 315)
