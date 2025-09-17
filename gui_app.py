@@ -814,7 +814,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _create_bots_tab(self) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout()
+        outer_layout = QtWidgets.QVBoxLayout()
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+
+        inner_widget = QtWidgets.QWidget()
+        inner_layout = QtWidgets.QVBoxLayout()
 
         info_label = QtWidgets.QLabel(
             "Instrukcje pracy z trybami:\n"
@@ -823,12 +829,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "- w danej chwili uruchomiony może być tylko jeden tryb."
         )
         info_label.setWordWrap(True)
-        layout.addWidget(info_label)
+        inner_layout.addWidget(info_label)
 
         for config in self.bot_configs:
             control = BotControlWidget(config)
             control.start_requested.connect(self._start_bot)
-            layout.addWidget(control)
+            inner_layout.addWidget(control)
             self.bot_controls[config.identifier] = control
             self.bot_runners[config.identifier] = BotRunner(
                 config=config, log_sink=self.log_handler.emit
@@ -852,10 +858,14 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons_layout.addWidget(reset_button)
         buttons_layout.addStretch(1)
 
-        layout.addLayout(buttons_layout)
+        inner_layout.addLayout(buttons_layout)
 
-        layout.addStretch(1)
-        widget.setLayout(layout)
+        inner_layout.addStretch(1)
+
+        inner_widget.setLayout(inner_layout)
+        scroll_area.setWidget(inner_widget)
+        outer_layout.addWidget(scroll_area)
+        widget.setLayout(outer_layout)
         return widget
 
     def _create_logs_tab(self) -> QtWidgets.QWidget:
