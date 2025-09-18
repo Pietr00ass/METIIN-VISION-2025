@@ -8,6 +8,7 @@ TARGET_TEMPLATES_DIR = DATA_DIR / "target_templates"
 EFFECTS = TARGET_TEMPLATES_DIR / "effects"
 ITEMS = TARGET_TEMPLATES_DIR / "items"
 METINS_DIR = TARGET_TEMPLATES_DIR / "metins"
+WUKONG_TEMPLATES_DIR = TARGET_TEMPLATES_DIR / "wukong"
 MODELS_DIR = PurePath("models")
 DATASETS_DIR = DATA_DIR / "datasets"
 
@@ -70,6 +71,10 @@ class ResourceName(Enum):
     WUKONG_PHOENIX_EGG = "jajo"
     WUKONG_RESTART = "zacznij_dung"
     WUKONG_RESTART_CONFIRM = "zaakceptuj_dung"
+    WUKONG_METIN = "wukong_metin"
+    WUKONG_MOB = "wukong_mob"
+    WUKONG_CRIMSON_GOURD = "wukong_crimson_gourd"
+    WUKONG_MONKEY_KING = "wukong_monkey_king"
 
 
 # WINDOW_NAME = "Akademia Valium.pl"
@@ -97,6 +102,10 @@ LOADING_ICON_FPATH = TARGET_TEMPLATES_DIR / "valium_akademia_loading.png"
 WUKONG_PHOENIX_EGG_FPATH = ITEMS / "jajo.png"
 WUKONG_RESTART_BUTTON_FPATH = ITEMS / "zacznij_dung.png"
 WUKONG_RESTART_CONFIRM_FPATH = ITEMS / "zaakceptuj_dung.png"
+WUKONG_METIN_TEMPLATE_FPATH = WUKONG_TEMPLATES_DIR / "metin.png"
+WUKONG_MOB_TEMPLATE_FPATH = WUKONG_TEMPLATES_DIR / "mob.png"
+WUKONG_CRIMSON_GOURD_TEMPLATE_FPATH = WUKONG_TEMPLATES_DIR / "gourd.png"
+WUKONG_MONKEY_KING_TEMPLATE_FPATH = WUKONG_TEMPLATES_DIR / "wukong.png"
 
 CAP_MAX_FPS = 30
 WINDOW_NOT_FOUND_EXIT_DELAY = 4
