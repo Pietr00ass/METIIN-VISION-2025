@@ -30,6 +30,21 @@ from utils import setup_logger
 
 LOG_FORMAT = "{time:HH:mm:ss} | {level:<8} | {message}"
 
+BOT_USAGE_INSTRUCTIONS = (
+    "Instrukcje pracy z trybami:\n"
+    "- każdy tryb ma własną zakładkę – przełącz się na właściwą przed uruchomieniem.\n"
+    "- wartości liczbowe podawaj w sekundach (chyba że opis wskazuje inaczej).\n"
+    "- zmiany nazw pól i wartości zapisujesz przyciskiem 'Zapisz konfigurację GUI'.\n"
+    "- w danej chwili uruchomiony może być tylko jeden tryb."
+)
+
+BOT_TAB_TITLES: Dict[str, str] = {
+    "fishbot": "Fishbot",
+    "wukong": "WuKong",
+    "dung_polana": "Leśna Polana",
+    "idle_metins": "Idle Metins",
+}
+
 
 class QtLogHandler(QtCore.QObject):
     """Bridge loguru logs to the GUI."""
@@ -871,7 +886,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _setup_ui(self) -> None:
         tabs = QtWidgets.QTabWidget()
-        tabs.addTab(self._create_bots_tab(), "Tryby")
+
+        for config in self.bot_configs:
+            bot_tab = self._create_single_bot_tab(config)
+            tabs.addTab(bot_tab, self._bot_tab_title(config))
 
         self.teleport_widget = TeleportConfigWidget()
         initial_sequence = load_teleport_sequence(self.config_data)
@@ -885,61 +903,61 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setCentralWidget(tabs)
 
-    def _create_bots_tab(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        outer_layout = QtWidgets.QVBoxLayout()
+    def _bot_tab_title(self, config: BotConfig) -> str:
+        return BOT_TAB_TITLES.get(config.identifier, config.title)
 
+    def _create_gui_actions_layout(self) -> QtWidgets.QHBoxLayout:
+        layout = QtWidgets.QHBoxLayout()
+        save_button = QtWidgets.QPushButton("Zapisz konfigurację GUI")
+        save_button.clicked.connect(self._save_gui_config)
+        layout.addWidget(save_button)
+
+        reset_button = QtWidgets.QPushButton("Przywróć domyślne GUI")
+        reset_button.clicked.connect(self._reset_gui_defaults)
+        layout.addWidget(reset_button)
+        layout.addStretch(1)
+        return layout
+
+    def _create_single_bot_tab(self, config: BotConfig) -> QtWidgets.QWidget:
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
 
         inner_widget = QtWidgets.QWidget()
         inner_layout = QtWidgets.QVBoxLayout()
+        inner_layout.setContentsMargins(12, 12, 12, 12)
+        inner_layout.setSpacing(12)
 
-        info_label = QtWidgets.QLabel(
-            "Instrukcje pracy z trybami:\n"
-            "- każdy tryb można dowolnie skonfigurować przed uruchomieniem (wartości liczbowe podawaj w sekundach).\n"
-            "- zmiany nazw pól i wartości zapisujesz przyciskiem 'Zapisz konfigurację GUI'.\n"
-            "- w danej chwili uruchomiony może być tylko jeden tryb."
-        )
+        info_label = QtWidgets.QLabel(BOT_USAGE_INSTRUCTIONS)
         info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #444; font-size: 12px;")
         inner_layout.addWidget(info_label)
 
-        for config in self.bot_configs:
-            control = BotControlWidget(config)
-            control.start_requested.connect(self._start_bot)
-            inner_layout.addWidget(control)
-            self.bot_controls[config.identifier] = control
-            self.bot_runners[config.identifier] = BotRunner(
-                config=config, log_sink=self.log_handler.emit
-            )
-            runner = self.bot_runners[config.identifier]
-            runner.signals.started.connect(self._on_bot_started)
-            runner.signals.finished.connect(self._on_bot_finished)
-            runner.signals.failed.connect(self._on_bot_failed)
+        control = BotControlWidget(config)
+        control.start_requested.connect(self._start_bot)
+        inner_layout.addWidget(control)
+        self.bot_controls[config.identifier] = control
 
-            saved_state = self.gui_config.get(config.identifier)
-            if isinstance(saved_state, dict):
-                control.apply_customization(saved_state)
+        runner = BotRunner(config=config, log_sink=self.log_handler.emit)
+        runner.signals.started.connect(self._on_bot_started)
+        runner.signals.finished.connect(self._on_bot_finished)
+        runner.signals.failed.connect(self._on_bot_failed)
+        self.bot_runners[config.identifier] = runner
 
-        buttons_layout = QtWidgets.QHBoxLayout()
-        save_button = QtWidgets.QPushButton("Zapisz konfigurację GUI")
-        save_button.clicked.connect(self._save_gui_config)
-        buttons_layout.addWidget(save_button)
+        saved_state = self.gui_config.get(config.identifier)
+        if isinstance(saved_state, dict):
+            control.apply_customization(saved_state)
 
-        reset_button = QtWidgets.QPushButton("Przywróć domyślne GUI")
-        reset_button.clicked.connect(self._reset_gui_defaults)
-        buttons_layout.addWidget(reset_button)
-        buttons_layout.addStretch(1)
-
-        inner_layout.addLayout(buttons_layout)
-
+        inner_layout.addLayout(self._create_gui_actions_layout())
         inner_layout.addStretch(1)
 
         inner_widget.setLayout(inner_layout)
         scroll_area.setWidget(inner_widget)
-        outer_layout.addWidget(scroll_area)
-        widget.setLayout(outer_layout)
-        return widget
+
+        tab_widget = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab_widget)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll_area)
+        return tab_widget
 
     def _create_logs_tab(self) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
@@ -990,7 +1008,7 @@ class MainWindow(QtWidgets.QMainWindow):
         wukong_timeouts_count = len(wukong.DEFAULT_STAGE_TIMEOUTS)
         wukong_timeouts_default = ",".join(str(value) for value in wukong.DEFAULT_STAGE_TIMEOUTS)
 
-        return [
+        configs = [
             BotConfig(
                 identifier="dung_polana",
                 title="Upadła Polana",
@@ -1303,10 +1321,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 script_name=Path(wukong.__file__).name,
                 title_editable=True,
                 instructions=(
-                    f"Automatyzuje przechodzenie wyprawy WuKonga. Ustaw etap początkowy "
-                    f"({wukong_stage_min} = '{wukong_first_stage}', {wukong_stage_max} = '{wukong_last_stage}'), wybierz poziom logów oraz "
-                    "slot zapisanych danych logowania. Timeouty etapów wpisz jako "
-                    f"{wukong_timeouts_count} wartości w sekundach, oddzielonych przecinkami i odpowiadających kolejnym zadaniom wyprawy."
+                    "Automatyzuje przechodzenie wyprawy WuKonga. "
+                    f"Ustaw etap początkowy ({wukong_stage_min} = '{wukong_first_stage}', "
+                    f"{wukong_stage_max} = '{wukong_last_stage}'). "
+                    "Wybierz poziom logów oraz slot zapisanych danych logowania. "
+                    f"Timeouty etapów wpisz jako {wukong_timeouts_count} wartości w sekundach, "
+                    "oddzielonych przecinkami i odpowiadających kolejnym zadaniom wyprawy."
                 ),
                 parameters=[
                     BotParameter(
@@ -1352,6 +1372,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 ],
             ),
         ]
+
+        desired_order = {
+            "fishbot": 0,
+            "wukong": 1,
+            "dung_polana": 2,
+            "idle_metins": 3,
+        }
+        configs.sort(key=lambda cfg: desired_order.get(cfg.identifier, len(desired_order)))
+        return configs
 
     def _start_bot(self, bot_id: str, params: Dict[str, Any]) -> None:
         if self.active_bot and self.active_bot != bot_id:
