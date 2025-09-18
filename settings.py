@@ -67,6 +67,9 @@ class ResourceName(Enum):
     BUTELKA_DYWIZJI_FILLED_MSG = "butelka_dywizji_filled_msg"
     ZALOGUJ_BUTTON = "zaloguj_button"
     LOADING_ICON = "loading_icon"
+    WUKONG_PHOENIX_EGG = "jajo"
+    WUKONG_RESTART = "zacznij_dung"
+    WUKONG_RESTART_CONFIRM = "zaakceptuj_dung"
 
 
 # WINDOW_NAME = "Akademia Valium.pl"
@@ -91,6 +94,9 @@ TEMPLATE_VALIUM_MSG_FPATH = TARGET_TEMPLATES_DIR / "valium_message_lowbar.png"
 BUTELKA_DYWIZJI_FILLED_MSG_FPATH = TARGET_TEMPLATES_DIR / "butelka_dywizji_filled_msg.png"
 ZALOGUJ_BUTTON_FPATH = TARGET_TEMPLATES_DIR / "zaloguj_button.png"
 LOADING_ICON_FPATH = TARGET_TEMPLATES_DIR / "valium_akademia_loading.png"
+WUKONG_PHOENIX_EGG_FPATH = ITEMS / "jajo.png"
+WUKONG_RESTART_BUTTON_FPATH = ITEMS / "zacznij_dung.png"
+WUKONG_RESTART_CONFIRM_FPATH = ITEMS / "zaakceptuj_dung.png"
 
 CAP_MAX_FPS = 30
 WINDOW_NOT_FOUND_EXIT_DELAY = 4
