@@ -1,6 +1,6 @@
 from pathlib import PurePath
 from time import sleep
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pytesseract
 
@@ -25,6 +25,9 @@ from settings import (
     WINDOW_WIDTH,
     ZALOGUJ_BUTTON_FPATH,
     LOADING_ICON_FPATH,
+    WUKONG_PHOENIX_EGG_FPATH,
+    WUKONG_RESTART_BUTTON_FPATH,
+    WUKONG_RESTART_CONFIRM_FPATH,
     BotBind,
     ResourceName,
     WINDOW_NOT_FOUND_EXIT_DELAY,
@@ -43,16 +46,30 @@ class VisionDetector:
 
     def __init__(self, preview: bool = True):
         self.preview = preview
-        self.target_templates = {
-            ResourceName.POLYMORPH.value: self._imread_template(ICO_POLYMORPH_FPATH),
-            ResourceName.RUNO_LESNE.value: self._imread_template(ICO_RUNO_LESNE_FPATH),
-            ResourceName.RUNO_LESNE_DROPPED.value: self._imread_binarize_template(RUNO_LESNE_DROPPED_FPATH, min_grayscale_threshold=254),  # 254 to capture only white pixels - item name
-            ResourceName.VALIUM_MSG.value: self._imread_template(TEMPLATE_VALIUM_MSG_FPATH),
-            ResourceName.BUTELKA_DYWIZJI_FILLED_MSG.value: self._imread_template(BUTELKA_DYWIZJI_FILLED_MSG_FPATH),
-            ResourceName.BUTELKA_DYWIZJI.value: self._imread_gray_template(TEMPLATE_BUTELKA_DYWIZJI_FPATH),
-            ResourceName.ZALOGUJ_BUTTON.value: self._imread_template(ZALOGUJ_BUTTON_FPATH),
-            ResourceName.LOADING_ICON.value: self._imread_template(LOADING_ICON_FPATH),
-        }
+        self.target_templates = {}
+        self._register_template(ResourceName.POLYMORPH, ICO_POLYMORPH_FPATH)
+        self._register_template(ResourceName.RUNO_LESNE, ICO_RUNO_LESNE_FPATH)
+        self._register_template(
+            ResourceName.RUNO_LESNE_DROPPED,
+            RUNO_LESNE_DROPPED_FPATH,
+            binarize_threshold=254,
+        )  # 254 to capture only white pixels - item name
+        self._register_template(ResourceName.VALIUM_MSG, TEMPLATE_VALIUM_MSG_FPATH)
+        self._register_template(ResourceName.BUTELKA_DYWIZJI_FILLED_MSG, BUTELKA_DYWIZJI_FILLED_MSG_FPATH)
+        self._register_template(
+            ResourceName.BUTELKA_DYWIZJI,
+            TEMPLATE_BUTELKA_DYWIZJI_FPATH,
+            grayscale=True,
+        )
+        self._register_template(ResourceName.ZALOGUJ_BUTTON, ZALOGUJ_BUTTON_FPATH)
+        self._register_template(ResourceName.LOADING_ICON, LOADING_ICON_FPATH)
+        self._register_template(ResourceName.WUKONG_PHOENIX_EGG, WUKONG_PHOENIX_EGG_FPATH, optional=True)
+        self._register_template(ResourceName.WUKONG_RESTART, WUKONG_RESTART_BUTTON_FPATH, optional=True)
+        self._register_template(
+            ResourceName.WUKONG_RESTART_CONFIRM,
+            WUKONG_RESTART_CONFIRM_FPATH,
+            optional=True,
+        )
 
         self.hwnd = self.get_window_handler()
         
@@ -103,8 +120,17 @@ class VisionDetector:
             frame = self.mark_polymorph_detection(frame, confidence, loc)
         return frame, polymorphed
 
+    def _get_template(self, resource: ResourceName) -> Optional[np.ndarray]:
+        template = self.target_templates.get(resource.value)
+        if template is None:
+            logger.debug("Szablon '%s' nie został załadowany – pomijam detekcję.", resource.value)
+        return template
+
     def _find_by_template(self, frame: np.ndarray, template: ResourceName, confidence_threshold: float) -> Tuple[bool, float, Tuple[int, int]]:
-        result = cv2.matchTemplate(frame, self.target_templates[template.value], cv2.TM_CCOEFF_NORMED)
+        template_img = self._get_template(template)
+        if template_img is None:
+            return False, 0.0, (0, 0)
+        result = cv2.matchTemplate(frame, template_img, cv2.TM_CCOEFF_NORMED)
         _, confidence, _, loc = cv2.minMaxLoc(result)
         active = confidence >= confidence_threshold
         logger.debug(f"{template.value} {'DETECTED' if active else 'NOT DETECTED'}\t{confidence=:.2f} {loc=}")
@@ -112,9 +138,48 @@ class VisionDetector:
 
     def _find_many_by_template(self, frame: np.ndarray, template: ResourceName, confidence_threshold: float) -> Tuple[Tuple[int, int]]:
         # returns a list of tuples with (x, y) coordinates of the detected objects
-        result = cv2.matchTemplate(frame, self.target_templates[template.value], cv2.TM_CCOEFF_NORMED)
+        template_img = self._get_template(template)
+        if template_img is None:
+            return tuple()
+        result = cv2.matchTemplate(frame, template_img, cv2.TM_CCOEFF_NORMED)
         locs = np.where(result >= confidence_threshold)
         return tuple(zip(*locs[::-1]))
+
+    def locate_all_templates(
+        self,
+        resource: ResourceName,
+        *,
+        frame: Optional[np.ndarray] = None,
+        threshold: float = 0.85,
+    ) -> Tuple[Tuple[int, int], ...]:
+        template_img = self._get_template(resource)
+        if template_img is None:
+            return tuple()
+
+        if frame is None:
+            frame = self.capture_frame()
+        if frame is None:
+            return tuple()
+
+        locs = self._find_many_by_template(frame, resource, threshold)
+        if not locs:
+            return tuple()
+
+        template_wh = self.get_img_wh(template_img)
+        return tuple(
+            self.get_global_pos(self.get_bbox_center(x, y, *template_wh))
+            for x, y in locs
+        )
+
+    def locate_template(
+        self,
+        resource: ResourceName,
+        *,
+        frame: Optional[np.ndarray] = None,
+        threshold: float = 0.85,
+    ) -> Optional[Tuple[int, int]]:
+        matches = self.locate_all_templates(resource, frame=frame, threshold=threshold)
+        return matches[0] if matches else None
 
     def detect_runo_lesne(self, frame: np.ndarray) -> Tuple[bool, float, Tuple[int, int]]:
         detected, confidence, loc = self._find_by_template(frame, ResourceName.RUNO_LESNE, confidence_threshold=0.8)
@@ -291,8 +356,40 @@ class VisionDetector:
         frame = VisionDetector.mark_bbox(frame, x, y, w, h, color, thickness)
         return frame
 
+    def _register_template(
+        self,
+        resource: ResourceName,
+        png_fpath: PurePath,
+        *,
+        grayscale: bool = False,
+        binarize_threshold: Optional[int] = None,
+        optional: bool = False,
+    ) -> None:
+        try:
+            if binarize_threshold is not None:
+                template = self._imread_binarize_template(png_fpath, binarize_threshold)
+            elif grayscale:
+                template = self._imread_gray_template(png_fpath)
+            else:
+                template = self._imread_template(png_fpath)
+        except FileNotFoundError as exc:
+            message = f"Szablon '{resource.value}' nie znaleziony pod ścieżką {png_fpath}"
+            if optional:
+                logger.warning(message)
+                return
+            raise FileNotFoundError(message) from exc
+        except Exception as exc:  # pragma: no cover - unexpected I/O issues
+            if optional:
+                logger.warning("Nie udało się załadować szablonu '%s': %s", resource.value, exc)
+                return
+            raise
+
+        self.target_templates[resource.value] = template
+
     def _imread_template(self, png_fpath: PurePath) -> cv2.UMat:
         img = cv2.imread(str(png_fpath), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(png_fpath)
         return self.drop_alpha_channel(img)
 
     def _imread_gray_template(self, png_fpath: PurePath) -> cv2.UMat:

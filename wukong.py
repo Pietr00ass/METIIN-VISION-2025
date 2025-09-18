@@ -19,8 +19,7 @@ import click
 from loguru import logger
 
 from game_controller import GameController
-import positions
-from settings import GameBind, UserBind
+from settings import GameBind, ResourceName, UserBind
 from utils import setup_logger
 from vision_detector import VisionDetector
 
@@ -43,13 +42,31 @@ class WuKongAutomationConfig:
 
     egg_slots: Tuple[Tuple[int, int], ...]
     restart_button: Optional[Tuple[int, int]] = None
+    restart_confirm_button: Optional[Tuple[int, int]] = None
 
 
 CONFIG_PATH = Path("data/wukong_config.json")
 
+DEFAULT_EGG_SLOT_CANDIDATES: Tuple[Tuple[int, int], ...] = (
+    (648, 244),
+    (680, 244),
+    (710, 244),
+    (742, 244),
+    (776, 224),
+    (648, 275),
+    (680, 275),
+    (710, 275),
+    (742, 275),
+    (776, 275),
+)
+
+DEFAULT_RESTART_BUTTON = (733, 65)
+DEFAULT_RESTART_CONFIRM_BUTTON = (359, 318)
+
 DEFAULT_AUTOMATION_CONFIG = WuKongAutomationConfig(
-    egg_slots=tuple(positions.EQ_SLOT_SELECT_BTNS),
-    restart_button=None,
+    egg_slots=DEFAULT_EGG_SLOT_CANDIDATES,
+    restart_button=DEFAULT_RESTART_BUTTON,
+    restart_confirm_button=DEFAULT_RESTART_CONFIRM_BUTTON,
 )
 
 
@@ -89,21 +106,28 @@ def _load_wukong_config(path: Path = CONFIG_PATH) -> WuKongAutomationConfig:
 
     egg_slots = _ensure_points("egg_slots")
 
-    restart_btn_raw = raw_data.get("restart_button")
-    restart_button: Optional[Tuple[int, int]]
-    if restart_btn_raw:
+    def _ensure_point(key: str) -> Optional[Tuple[int, int]]:
+        value = raw_data.get(key)
+        if not value:
+            return getattr(DEFAULT_AUTOMATION_CONFIG, key)
         try:
-            restart_button = (int(restart_btn_raw[0]), int(restart_btn_raw[1]))
+            return int(value[0]), int(value[1])
         except (TypeError, ValueError, IndexError):
             logger.error(
-                "Nieprawidłowe współrzędne przycisku restartu w %s – używam wartości domyślnej.",
+                "Nieprawidłowe współrzędne w polu '%s' w %s – korzystam z domyślnych.",
+                key,
                 path,
             )
-            restart_button = DEFAULT_AUTOMATION_CONFIG.restart_button
-    else:
-        restart_button = DEFAULT_AUTOMATION_CONFIG.restart_button
+            return getattr(DEFAULT_AUTOMATION_CONFIG, key)
 
-    return WuKongAutomationConfig(egg_slots=egg_slots, restart_button=restart_button)
+    restart_button = _ensure_point("restart_button")
+    restart_confirm_button = _ensure_point("restart_confirm_button")
+
+    return WuKongAutomationConfig(
+        egg_slots=egg_slots,
+        restart_button=restart_button,
+        restart_confirm_button=restart_confirm_button,
+    )
 
 
 STAGES: Tuple[StageDefinition, ...] = (
@@ -396,17 +420,46 @@ def _monitor_stage(
 
 
 def _use_phoenix_eggs(game: GameController) -> None:
-    if not AUTOMATION_CONFIG.egg_slots:
-        logger.warning("Brak skonfigurowanych slotów jaj feniksa – pomiń krok automatyczny.")
-        return
-
-    logger.info("Próbuję użyć jaj feniksa z ekwipunku (%d sloty).", len(AUTOMATION_CONFIG.egg_slots))
+    logger.info("Otwieram ekwipunek w poszukiwaniu jaj feniksa.")
     game.tap_key(GameBind.EQ_MENU)
     sleep(0.4)
-    for slot in AUTOMATION_CONFIG.egg_slots:
-        global_pos = game.vision_detector.get_global_pos(slot)
-        game.click_at(global_pos, right=True)
+
+    vision = game.vision_detector
+    frame = vision.capture_frame()
+    detected_positions: Tuple[Tuple[int, int], ...] = tuple()
+
+    if frame is None:
+        logger.warning("Nie udało się pobrać klatki ekranu – używam pozycji zapasowych.")
+    else:
+        detected_positions = vision.locate_all_templates(
+            ResourceName.WUKONG_PHOENIX_EGG,
+            frame=frame,
+            threshold=0.82,
+        )
+        if detected_positions:
+            logger.info("Wykryto %d jaj feniksa w ekwipunku.", len(detected_positions))
+
+    if not detected_positions:
+        if not AUTOMATION_CONFIG.egg_slots:
+            logger.warning(
+                "Brak skonfigurowanych slotów jaj feniksa – oczekuję na ręczne użycie przedmiotu."
+            )
+            fallback_positions: Tuple[Tuple[int, int], ...] = tuple()
+        else:
+            fallback_positions = tuple(
+                vision.get_global_pos(slot) for slot in AUTOMATION_CONFIG.egg_slots
+            )
+            logger.info(
+                "Nie znaleziono jaj poprzez wzorzec – klikam %d zaprogramowanych slotów.",
+                len(fallback_positions),
+            )
+        detected_positions = fallback_positions
+
+    unique_positions = list(dict.fromkeys(detected_positions))
+    for pos in unique_positions:
+        game.click_at(pos, right=True)
         sleep(0.2)
+
     game.tap_key(GameBind.EQ_MENU)
     sleep(0.3)
 
@@ -521,6 +574,57 @@ def _run_combat_stage(
         )
     finally:
         game.stop_attack()
+
+
+def _execute_restart_sequence(game: GameController, vision: VisionDetector) -> bool:
+    frame = vision.capture_frame()
+    start_pos = vision.locate_template(ResourceName.WUKONG_RESTART, frame=frame, threshold=0.8)
+    fallback_start = (
+        vision.get_global_pos(AUTOMATION_CONFIG.restart_button)
+        if AUTOMATION_CONFIG.restart_button is not None
+        else None
+    )
+
+    if start_pos is not None:
+        logger.info("Wzorzec przycisku restartu odnaleziony – klikam.")
+    elif fallback_start is not None:
+        logger.info(
+            "Nie znaleziono wzorca restartu – klikam zapasowe współrzędne %s.",
+            AUTOMATION_CONFIG.restart_button,
+        )
+        start_pos = fallback_start
+    else:
+        logger.warning(
+            "Brak szablonu i zapasowych współrzędnych przycisku restartu – oczekuję na kliknięcie ręczne."
+        )
+        return False
+
+    game.click_at(start_pos)
+    sleep(0.6)
+
+    frame = vision.capture_frame()
+    confirm_pos = vision.locate_template(ResourceName.WUKONG_RESTART_CONFIRM, frame=frame, threshold=0.8)
+    fallback_confirm = (
+        vision.get_global_pos(AUTOMATION_CONFIG.restart_confirm_button)
+        if AUTOMATION_CONFIG.restart_confirm_button is not None
+        else None
+    )
+
+    if confirm_pos is not None:
+        logger.info("Znalazłem przycisk potwierdzenia restartu – klikam.")
+    elif fallback_confirm is not None:
+        logger.info(
+            "Brak wzorca potwierdzenia – klikam zapasowe współrzędne %s.",
+            AUTOMATION_CONFIG.restart_confirm_button,
+        )
+        confirm_pos = fallback_confirm
+    else:
+        logger.warning("Nie mogę potwierdzić restartu – brak współrzędnych zapasowych.")
+        return False
+
+    game.click_at(confirm_pos)
+    sleep(0.5)
+    return True
 
 
 def _handle_slay_first_wave(
@@ -742,16 +846,7 @@ def _handle_restart_expedition(
 ) -> None:
     _wait_for_stage_prompt(vision, stage, timeout)
 
-    if AUTOMATION_CONFIG.restart_button is not None:
-        logger.info(
-            "Klikam przycisk restartu pod współrzędnymi %s.",
-            AUTOMATION_CONFIG.restart_button,
-        )
-        game.click_at(game.vision_detector.get_global_pos(AUTOMATION_CONFIG.restart_button))
-        sleep(1.0)
-    else:
-        logger.warning(
-            "Brak zdefiniowanych współrzędnych przycisku restartu – oczekuję na ręczną interakcję.")
+    _execute_restart_sequence(game, vision)
 
     _monitor_stage(
         game,
