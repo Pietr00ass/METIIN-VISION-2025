@@ -13,13 +13,16 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter, sleep
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import click
+import numpy as np
 from loguru import logger
+from ultralytics import YOLO
+from ultralytics import checks as yolo_checks
 
 from game_controller import GameController
-from settings import GameBind, ResourceName, UserBind
+from settings import GameBind, ResourceName, UserBind, MODELS_DIR
 from utils import setup_logger
 from vision_detector import VisionDetector
 
@@ -72,6 +75,77 @@ DEFAULT_AUTOMATION_CONFIG = WuKongAutomationConfig(
 
 class StageTimeoutError(RuntimeError):
     """Raised when a WuKong stage exceeds its allotted timeout."""
+
+
+YOLO_MODEL_FILENAME = "wukong.pt"
+DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.6
+DEFAULT_YOLO_DEVICE = "cuda:0"
+
+WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
+    ResourceName.WUKONG_MOB: (
+        ResourceName.WUKONG_MOB.value,
+        "mob",
+        "monster",
+        "wave_mob",
+        "moby",
+    ),
+    ResourceName.WUKONG_METIN: (
+        ResourceName.WUKONG_METIN.value,
+        "metin",
+        "metin_stone",
+        "stone",
+    ),
+    ResourceName.WUKONG_CRIMSON_GOURD: (
+        ResourceName.WUKONG_CRIMSON_GOURD.value,
+        "crimson_gourd",
+        "gourd",
+        "karmazynowy_gourd",
+        "karmazynowy_gurd",
+    ),
+    ResourceName.WUKONG_MONKEY_KING: (
+        ResourceName.WUKONG_MONKEY_KING.value,
+        "monkey_king",
+        "wukong",
+        "boss",
+    ),
+    ResourceName.WUKONG_CLOUD_GUARDIAN: (
+        ResourceName.WUKONG_CLOUD_GUARDIAN.value,
+        "cloud_guardian",
+        "guardian",
+        "obronca_chmur",
+    ),
+    ResourceName.WUKONG_PHOENIX_EGG: (
+        ResourceName.WUKONG_PHOENIX_EGG.value,
+        "phoenix_egg",
+        "egg",
+        "jaja_feniksa",
+    ),
+    ResourceName.WUKONG_FLAMING_PHOENIX: (
+        ResourceName.WUKONG_FLAMING_PHOENIX.value,
+        "flaming_phoenix",
+        "phoenix",
+        "plomienny_feniks",
+    ),
+}
+
+_OPTIONAL_YOLO_RESOURCES = {ResourceName.WUKONG_PHOENIX_EGG}
+
+
+class DetectionResult(NamedTuple):
+    positions: Tuple[Tuple[int, int], ...]
+    method: str
+
+
+DETECTION_METHOD_FRAME_MISSING = "frame_missing"
+DETECTION_METHOD_YOLO = "yolo"
+DETECTION_METHOD_TEMPLATE = "template"
+DETECTION_METHOD_UNAVAILABLE = "unavailable"
+
+
+_YOLO_MODEL: YOLO | None = None
+_YOLO_CLASS_IDS: Dict[ResourceName, int] = {}
+_YOLO_CONFIDENCE_THRESHOLD = DEFAULT_YOLO_CONFIDENCE_THRESHOLD
+_YOLO_VERBOSE = False
 
 
 def _load_wukong_config(path: Path = CONFIG_PATH) -> WuKongAutomationConfig:
@@ -128,6 +202,194 @@ def _load_wukong_config(path: Path = CONFIG_PATH) -> WuKongAutomationConfig:
         restart_button=restart_button,
         restart_confirm_button=restart_confirm_button,
     )
+
+
+def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
+    raw_names = {}
+    try:
+        raw_names = getattr(model, "names", {}) or {}
+    except AttributeError:
+        raw_names = {}
+
+    if not raw_names:
+        raw_names = getattr(getattr(model, "model", None), "names", {}) or {}
+
+    normalized = {str(name).lower(): int(idx) for idx, name in raw_names.items()}
+    if not normalized:
+        logger.warning("Model YOLO nie udostępnia nazw klas – mapowanie WuKonga będzie niedostępne.")
+        return {}
+
+    mapping: Dict[ResourceName, int] = {}
+    available = ", ".join(sorted(normalized))
+    for resource, aliases in WUKONG_YOLO_ALIASES.items():
+        for alias in aliases:
+            class_idx = normalized.get(alias.lower())
+            if class_idx is not None:
+                mapping[resource] = class_idx
+                break
+        else:
+            log_func = logger.debug if resource in _OPTIONAL_YOLO_RESOURCES else logger.warning
+            log_func(
+                "Klasa YOLO dla zasobu '%s' nie została znaleziona w modelu. Dostępne klasy: %s",
+                resource.value,
+                available,
+            )
+
+    return mapping
+
+
+def _initialize_yolo_model(device: str) -> None:
+    global _YOLO_MODEL, _YOLO_CLASS_IDS
+
+    if _YOLO_MODEL is not None:
+        return
+
+    try:
+        yolo_checks()
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning("Weryfikacja środowiska YOLO zakończona ostrzeżeniem: %s", exc)
+
+    model_path = Path(MODELS_DIR) / YOLO_MODEL_FILENAME
+    if not model_path.exists():
+        logger.warning(
+            "Model YOLO WuKonga nie został znaleziony pod ścieżką %s – powracam do detekcji szablonowej.",
+            model_path,
+        )
+        return
+
+    try:
+        model = YOLO(model_path)
+    except Exception as exc:  # pragma: no cover - runtime environment specific
+        logger.error("Nie udało się załadować modelu YOLO %s: %s", model_path, exc)
+        return
+
+    try:
+        model.to(device)
+    except Exception as exc:  # pragma: no cover - CUDA availability varies
+        logger.warning("Nie można załadować modelu na urządzenie %s (%s). Używam CPU.", device, exc)
+        model.to("cpu")
+
+    _YOLO_MODEL = model
+    _YOLO_CLASS_IDS = _resolve_yolo_class_map(model)
+
+    if _YOLO_CLASS_IDS:
+        logger.info("Załadowano model YOLO WuKonga – zmapowano %d klas.", len(_YOLO_CLASS_IDS))
+    else:
+        logger.warning("Model YOLO WuKonga załadowany, lecz nie znaleziono żadnych zgodnych klas.")
+
+
+def _get_yolo_class_id(resource: ResourceName) -> Optional[int]:
+    return _YOLO_CLASS_IDS.get(resource)
+
+
+def _predict_yolo(frame: np.ndarray, *, conf: Optional[float] = None):
+    if _YOLO_MODEL is None:
+        return None
+
+    inference_conf = _YOLO_CONFIDENCE_THRESHOLD if conf is None else max(float(conf), _YOLO_CONFIDENCE_THRESHOLD)
+
+    try:
+        results_list = _YOLO_MODEL.predict(
+            source=VisionDetector.fill_non_clickable_wth_black(frame.copy()),
+            conf=inference_conf,
+            verbose=_YOLO_VERBOSE,
+        )
+    except Exception as exc:  # pragma: no cover - runtime specific
+        logger.error("Błąd podczas inferencji modelu YOLO WuKonga: %s", exc)
+        return None
+
+    if not results_list:
+        return None
+
+    return results_list[0]
+
+
+def _detect_with_yolo(
+    vision: VisionDetector,
+    frame: np.ndarray,
+    resource: ResourceName,
+    *,
+    threshold: Optional[float] = None,
+) -> Tuple[Tuple[int, int], ...]:
+    class_id = _get_yolo_class_id(resource)
+    if class_id is None:
+        return tuple()
+
+    result = _predict_yolo(frame, conf=threshold)
+    if result is None or result.boxes is None or result.boxes.cls is None:
+        return tuple()
+
+    classes = result.boxes.cls.cpu().numpy().astype(int)
+    confidences = (
+        result.boxes.conf.cpu().numpy()
+        if getattr(result.boxes, "conf", None) is not None
+        else np.ones_like(classes, dtype=float)
+    )
+    mask = classes == class_id
+
+    if threshold is not None:
+        mask &= confidences >= float(threshold)
+
+    if not np.any(mask):
+        return tuple()
+
+    xywh = result.boxes.xywh.cpu().numpy()
+    centers = xywh[mask, :2]
+    return tuple(
+        vision.get_global_pos((int(round(x)), int(round(y))))
+        for x, y in centers
+    )
+
+
+def _detect_resource_positions(
+    vision: VisionDetector,
+    resource: ResourceName,
+    *,
+    frame: Optional[np.ndarray] = None,
+    threshold: Optional[float] = None,
+) -> DetectionResult:
+    fallback_threshold = threshold if threshold is not None else 0.85
+
+    if frame is None:
+        frame = vision.capture_frame()
+    if frame is None:
+        return DetectionResult(tuple(), DETECTION_METHOD_FRAME_MISSING)
+
+    if _YOLO_MODEL is not None and _get_yolo_class_id(resource) is not None:
+        detections = _detect_with_yolo(vision, frame, resource, threshold=threshold)
+        if detections:
+            return DetectionResult(detections, DETECTION_METHOD_YOLO)
+        if resource.value in vision.target_templates:
+            template_detections = vision.locate_all_templates(
+                resource,
+                frame=frame,
+                threshold=fallback_threshold,
+            )
+            if template_detections:
+                logger.debug(
+                    "Model YOLO nie wykrył '%s' – korzystam z klasycznego wzorca jako wsparcia.",
+                    resource.value,
+                )
+                return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+        return DetectionResult(tuple(), DETECTION_METHOD_YOLO)
+
+    if resource.value in vision.target_templates:
+        template_detections = vision.locate_all_templates(
+            resource,
+            frame=frame,
+            threshold=fallback_threshold,
+        )
+        return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+
+    return DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
+
+
+def _detection_method_verbose_label(method: str) -> str:
+    if method == DETECTION_METHOD_YOLO:
+        return "modelem YOLO"
+    if method == DETECTION_METHOD_TEMPLATE:
+        return "szablonem"
+    return "niezidentyfikowanym detektorem"
 
 
 STAGES: Tuple[StageDefinition, ...] = (
@@ -372,32 +634,37 @@ def _confirm_template_presence(
     *,
     threshold: float = 0.82,
 ) -> None:
-    if resource.value not in vision.target_templates:
-        logger.debug(
-            "Pominięto wstępne potwierdzenie %s – brak szablonu '%s'.",
-            label,
-            resource.value,
-        )
-        return
+    detection = _detect_resource_positions(
+        vision,
+        resource,
+        threshold=threshold,
+    )
+    method = detection.method
 
-    frame = vision.capture_frame()
-    if frame is None:
+    if method == DETECTION_METHOD_FRAME_MISSING:
         logger.warning("Nie udało się pobrać klatki do potwierdzenia %s.", label)
         return
 
-    detections = vision.locate_all_templates(
-        resource,
-        frame=frame,
-        threshold=threshold,
-    )
-    if detections:
-        logger.info("Potwierdzono obecność %s (detekcje: %d).", label, len(detections))
-    else:
+    if method == DETECTION_METHOD_UNAVAILABLE:
         logger.debug(
-            "Szablon '%s' dostępny, ale nie wykryto jeszcze %s.",
-            resource.value,
+            "Pominięto wstępne potwierdzenie %s – brak detektora dla '%s'.",
             label,
+            resource.value,
         )
+        return
+
+    if detection.positions:
+        logger.info(
+            "Potwierdzono obecność %s (%s; detekcje: %d).",
+            label,
+            _detection_method_verbose_label(method),
+            len(detection.positions),
+        )
+    else:
+        if method == DETECTION_METHOD_YOLO:
+            logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+        else:
+            logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
 
 
 def _make_template_presence_callback(
@@ -411,36 +678,48 @@ def _make_template_presence_callback(
     state = {"last_check": 0.0, "present": None, "missing_logged": False}
 
     def _callback(now: float) -> None:
-        if resource.value not in vision.target_templates:
+        if now - state["last_check"] < interval:
+            return
+
+        detection = _detect_resource_positions(
+            vision,
+            resource,
+            threshold=threshold,
+        )
+        method = detection.method
+
+        if method == DETECTION_METHOD_UNAVAILABLE:
             if not state["missing_logged"]:
                 logger.debug(
-                    "Pomijam monitorowanie %s – brak załadowanego szablonu '%s'.",
+                    "Pomijam monitorowanie %s – brak detektora dla '%s'.",
                     label,
                     resource.value,
                 )
                 state["missing_logged"] = True
+            state["last_check"] = now
             return
 
-        if now - state["last_check"] < interval:
+        if method == DETECTION_METHOD_FRAME_MISSING:
+            logger.warning("Nie udało się pobrać klatki do monitorowania %s.", label)
+            state["last_check"] = now
             return
 
-        detections = vision.locate_all_templates(resource, threshold=threshold)
-        present = bool(detections)
+        present = bool(detection.positions)
+        method_verbose = _detection_method_verbose_label(method)
 
         if state["present"] is None:
             if present:
-                logger.info("Wykryto %s.", label)
+                logger.info("Wykryto %s (%s).", label, method_verbose)
             else:
-                logger.debug(
-                    "Szablon '%s' aktywny, ale %s nie są widoczne.",
-                    resource.value,
-                    label,
-                )
+                if method == DETECTION_METHOD_YOLO:
+                    logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+                else:
+                    logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
         elif present != state["present"]:
             if present:
-                logger.info("%s ponownie widoczne.", label.capitalize())
+                logger.info("%s ponownie widoczne (%s).", label.capitalize(), method_verbose)
             else:
-                logger.success("%s nie są już wykrywane.", label.capitalize())
+                logger.success("%s nie są już wykrywane (%s).", label.capitalize(), method_verbose)
 
         state["present"] = present
         state["last_check"] = now
@@ -459,45 +738,59 @@ def _make_template_count_callback(
     state = {"last_check": 0.0, "count": None, "missing_logged": False}
 
     def _callback(now: float) -> None:
-        if resource.value not in vision.target_templates:
+        if now - state["last_check"] < interval:
+            return
+
+        detection = _detect_resource_positions(
+            vision,
+            resource,
+            threshold=threshold,
+        )
+        method = detection.method
+
+        if method == DETECTION_METHOD_UNAVAILABLE:
             if not state["missing_logged"]:
                 logger.debug(
-                    "Pomijam monitorowanie liczby %s – brak szablonu '%s'.",
+                    "Pomijam monitorowanie liczby %s – brak detektora dla '%s'.",
                     label,
                     resource.value,
                 )
                 state["missing_logged"] = True
+            state["last_check"] = now
             return
 
-        if now - state["last_check"] < interval:
+        if method == DETECTION_METHOD_FRAME_MISSING:
+            logger.warning("Nie udało się pobrać klatki do monitorowania liczby %s.", label)
+            state["last_check"] = now
             return
 
-        detections = vision.locate_all_templates(resource, threshold=threshold)
-        count = len(detections)
+        count = len(detection.positions)
+        method_verbose = _detection_method_verbose_label(method)
 
         if state["count"] is None:
             if count:
-                logger.info("Wykryto %d %s.", count, label)
+                logger.info("Wykryto %d %s (%s).", count, label, method_verbose)
             else:
-                logger.debug(
-                    "Szablon '%s' aktywny, ale nie wykryto %s.",
-                    resource.value,
-                    label,
-                )
+                if method == DETECTION_METHOD_YOLO:
+                    logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+                else:
+                    logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
         elif count != state["count"]:
             if count < state["count"]:
                 logger.success(
-                    "Pozostało %d %s (poprzednio %d).",
+                    "Pozostało %d %s (poprzednio %d; %s).",
                     count,
                     label,
                     state["count"],
+                    method_verbose,
                 )
             else:
                 logger.warning(
-                    "Liczba %s wzrosła z %d do %d.",
+                    "Liczba %s wzrosła z %d do %d (%s).",
                     label,
                     state["count"],
                     count,
+                    method_verbose,
                 )
 
         state["count"] = count
@@ -572,13 +865,33 @@ def _use_phoenix_eggs(game: GameController) -> None:
     if frame is None:
         logger.warning("Nie udało się pobrać klatki ekranu – używam pozycji zapasowych.")
     else:
-        detected_positions = vision.locate_all_templates(
+        detection = _detect_resource_positions(
+            vision,
             ResourceName.WUKONG_PHOENIX_EGG,
             frame=frame,
             threshold=0.82,
         )
+        detected_positions = detection.positions
+        method = detection.method
         if detected_positions:
-            logger.info("Wykryto %d jaj feniksa w ekwipunku.", len(detected_positions))
+            logger.info(
+                "Wykryto %d jaj feniksa w ekwipunku (%s).",
+                len(detected_positions),
+                _detection_method_verbose_label(method),
+            )
+        else:
+            if method == DETECTION_METHOD_UNAVAILABLE:
+                logger.debug(
+                    "Brak skonfigurowanego detektora jaj feniksa – korzystam z zapasowych współrzędnych.",
+                )
+            elif method == DETECTION_METHOD_YOLO:
+                logger.debug(
+                    "Detekcja YOLO nie znalazła jaj feniksa – używam pozycji zapasowych.",
+                )
+            else:
+                logger.debug(
+                    "Detekcja szablonowa nie znalazła jaj feniksa – używam pozycji zapasowych.",
+                )
 
     if not detected_positions:
         if not AUTOMATION_CONFIG.egg_slots:
@@ -591,7 +904,7 @@ def _use_phoenix_eggs(game: GameController) -> None:
                 vision.get_global_pos(slot) for slot in AUTOMATION_CONFIG.egg_slots
             )
             logger.info(
-                "Nie znaleziono jaj poprzez wzorzec – klikam %d zaprogramowanych slotów.",
+                "Nie znaleziono jaj poprzez automatyczną detekcję – klikam %d zaprogramowanych slotów.",
                 len(fallback_positions),
             )
         detected_positions = fallback_positions
@@ -856,6 +1169,16 @@ def _handle_defeat_cloud_guardian(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_CLOUD_GUARDIAN,
+        "Obrońcę Chmur WuKonga",
+    )
+    guardian_tracker = _make_template_presence_callback(
+        vision,
+        ResourceName.WUKONG_CLOUD_GUARDIAN,
+        label="Obrońcę Chmur WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -863,6 +1186,7 @@ def _handle_defeat_cloud_guardian(
         timeout,
         attack_interval=0.7,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+        extra_callbacks=(guardian_tracker,),
     )
 
 
@@ -975,6 +1299,16 @@ def _handle_defeat_flaming_phoenix(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_FLAMING_PHOENIX,
+        "Płomiennego Feniksa WuKonga",
+    )
+    phoenix_tracker = _make_template_presence_callback(
+        vision,
+        ResourceName.WUKONG_FLAMING_PHOENIX,
+        label="Płomiennego Feniksa WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -982,6 +1316,7 @@ def _handle_defeat_flaming_phoenix(
         timeout,
         attack_interval=0.7,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+        extra_callbacks=(phoenix_tracker,),
     )
 
 
@@ -1109,10 +1444,22 @@ def run(
     log_level: str,
     saved_credentials_idx: int,
     stage_timeouts: Sequence[float] | str = DEFAULT_STAGE_TIMEOUTS,
+    yolo_confidence_threshold: float = DEFAULT_YOLO_CONFIDENCE_THRESHOLD,
+    yolo_device: str = DEFAULT_YOLO_DEVICE,
 ) -> None:
     """Run WuKong expedition automation starting from the requested stage."""
 
-    del log_level  # Log level is configured globally via :func:`setup_logger`.
+    log_level = log_level.upper()
+
+    global _YOLO_CONFIDENCE_THRESHOLD, _YOLO_VERBOSE
+    _YOLO_CONFIDENCE_THRESHOLD = float(yolo_confidence_threshold)
+    _YOLO_VERBOSE = log_level in {"TRACE", "DEBUG"}
+
+    _initialize_yolo_model(yolo_device)
+    if _YOLO_MODEL is None:
+        logger.warning(
+            "Model YOLO WuKonga nie został załadowany – wykorzystywane będą jedynie dostępne szablony.",
+        )
 
     stage_timeouts_tuple = _parse_stage_timeouts(stage_timeouts)
     _validate_start_stage(stage)
@@ -1163,13 +1510,40 @@ def run(
     show_default=True,
     help="Comma separated per-stage timeout configuration.",
 )
-def main(stage: int, log_level: str, saved_credentials_idx: int, stage_timeouts: str) -> None:
+@click.option(
+    "--yolo-confidence-threshold",
+    default=DEFAULT_YOLO_CONFIDENCE_THRESHOLD,
+    show_default=True,
+    type=float,
+    help="Minimalna pewność detekcji YOLO (0-1).",
+)
+@click.option(
+    "--yolo-device",
+    default=DEFAULT_YOLO_DEVICE,
+    show_default=True,
+    help="Urządzenie dla modelu YOLO (np. 'cuda:0' lub 'cpu').",
+)
+def main(
+    stage: int,
+    log_level: str,
+    saved_credentials_idx: int,
+    stage_timeouts: str,
+    yolo_confidence_threshold: float,
+    yolo_device: str,
+) -> None:
     """CLI entrypoint mirroring :mod:`dung_polana`."""
 
     log_level = log_level.upper()
     setup_logger(script_name=Path(__file__).name, level=log_level)
     logger.warning("Starting the WuKong expedition bot...")
-    run(stage, log_level, saved_credentials_idx, stage_timeouts)
+    run(
+        stage,
+        log_level,
+        saved_credentials_idx,
+        stage_timeouts,
+        yolo_confidence_threshold,
+        yolo_device,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI behaviour
