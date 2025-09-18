@@ -82,50 +82,13 @@ DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.6
 DEFAULT_YOLO_DEVICE = "cuda:0"
 
 WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
-    ResourceName.WUKONG_MOB: (
-        ResourceName.WUKONG_MOB.value,
-        "mob",
-        "monster",
-        "wave_mob",
-        "moby",
-    ),
-    ResourceName.WUKONG_METIN: (
-        ResourceName.WUKONG_METIN.value,
-        "metin",
-        "metin_stone",
-        "stone",
-    ),
-    ResourceName.WUKONG_CRIMSON_GOURD: (
-        ResourceName.WUKONG_CRIMSON_GOURD.value,
-        "crimson_gourd",
-        "gourd",
-        "karmazynowy_gourd",
-        "karmazynowy_gurd",
-    ),
-    ResourceName.WUKONG_MONKEY_KING: (
-        ResourceName.WUKONG_MONKEY_KING.value,
-        "monkey_king",
-        "wukong",
-        "boss",
-    ),
-    ResourceName.WUKONG_CLOUD_GUARDIAN: (
-        ResourceName.WUKONG_CLOUD_GUARDIAN.value,
-        "cloud_guardian",
-        "guardian",
-        "obronca_chmur",
-    ),
-    ResourceName.WUKONG_PHOENIX_EGG: (
-        ResourceName.WUKONG_PHOENIX_EGG.value,
-        "phoenix_egg",
-        "egg",
-        "jaja_feniksa",
-    ),
-    ResourceName.WUKONG_FLAMING_PHOENIX: (
-        ResourceName.WUKONG_FLAMING_PHOENIX.value,
-        "flaming_phoenix",
-        "phoenix",
-        "plomienny_feniks",
-    ),
+    ResourceName.WUKONG_MOB: ("moby",),
+    ResourceName.WUKONG_METIN: ("metin",),
+    ResourceName.WUKONG_CRIMSON_GOURD: ("karmazynowy_gurd",),
+    ResourceName.WUKONG_MONKEY_KING: ("wukong",),
+    ResourceName.WUKONG_CLOUD_GUARDIAN: ("obronca_chmur",),
+    ResourceName.WUKONG_PHOENIX_EGG: ("jaja_feniksa",),
+    ResourceName.WUKONG_FLAMING_PHOENIX: ("plomienny_feniks",),
 }
 
 _OPTIONAL_YOLO_RESOURCES = {ResourceName.WUKONG_PHOENIX_EGG}
