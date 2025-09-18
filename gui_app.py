@@ -22,6 +22,7 @@ from config_manager import (
 import dung_polana
 import fishbot
 import idle_metins
+import wukong
 import settings
 from settings import BotBind, GameBind, UserBind
 from utils import setup_logger
@@ -982,6 +983,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return widget
 
     def _create_bot_configs(self) -> List[BotConfig]:
+        wukong_stage_min = 0
+        wukong_stage_max = len(wukong.STAGES) - 1
+        wukong_first_stage = wukong.STAGES[0].title
+        wukong_last_stage = wukong.STAGES[-1].title
+        wukong_timeouts_count = len(wukong.DEFAULT_STAGE_TIMEOUTS)
+        wukong_timeouts_default = ",".join(str(value) for value in wukong.DEFAULT_STAGE_TIMEOUTS)
+
         return [
             BotConfig(
                 identifier="dung_polana",
@@ -1285,6 +1293,61 @@ class MainWindow(QtWidgets.QMainWindow):
                         default="77,304,101,379",
                         placeholder="góra,dół,lewa,prawa",
                         help_text="Wymiary wycinka obrazu do analizy w pikselach (top,bottom,left,right).",
+                    ),
+                ],
+            ),
+            BotConfig(
+                identifier="wukong",
+                title="Wyprawa WuKonga",
+                target=wukong.run,
+                script_name=Path(wukong.__file__).name,
+                title_editable=True,
+                instructions=(
+                    f"Automatyzuje przechodzenie wyprawy WuKonga. Ustaw etap początkowy "
+                    f"({wukong_stage_min} = '{wukong_first_stage}', {wukong_stage_max} = '{wukong_last_stage}'), wybierz poziom logów oraz "
+                    "slot zapisanych danych logowania. Timeouty etapów wpisz jako "
+                    f"{wukong_timeouts_count} wartości w sekundach, oddzielonych przecinkami i odpowiadających kolejnym zadaniom wyprawy."
+                ),
+                parameters=[
+                    BotParameter(
+                        name="stage",
+                        label="Początkowy etap",
+                        type="int",
+                        default=0,
+                        minimum=0,
+                        maximum=wukong_stage_max,
+                        help_text=(
+                            f"Numer etapu, od którego bot ma rozpocząć "
+                            f"({wukong_stage_min}={wukong_first_stage}, {wukong_stage_max}={wukong_last_stage})."
+                        ),
+                    ),
+                    BotParameter(
+                        name="log_level",
+                        label="Poziom logów",
+                        type="choice",
+                        choices=["TRACE", "DEBUG", "INFO"],
+                        default="INFO",
+                        help_text="Określa szczegółowość logów zapisywanych w zakładce Logi.",
+                    ),
+                    BotParameter(
+                        name="saved_credentials_idx",
+                        label="Slot danych logowania",
+                        type="int",
+                        default=1,
+                        minimum=1,
+                        maximum=10,
+                        help_text="Numer slotu zapisanych danych logowania używany podczas automatycznego logowania.",
+                    ),
+                    BotParameter(
+                        name="stage_timeouts",
+                        label="Timeouty etapów",
+                        type="str",
+                        default=wukong_timeouts_default,
+                        placeholder=wukong_timeouts_default,
+                        help_text=(
+                            "Czasy limitów dla każdego etapu w sekundach – wpisz "
+                            f"{wukong_timeouts_count} liczb oddzielonych przecinkami odpowiadających kolejnym zadaniom wyprawy."
+                        ),
                     ),
                 ],
             ),
