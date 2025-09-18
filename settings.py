@@ -78,7 +78,7 @@ class ResourceName(Enum):
 
 
 # WINDOW_NAME = "Akademia Valium.pl"
-WINDOW_NAME = "METIN2"
+WINDOW_NAME = "Ervelia"
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 600
 
