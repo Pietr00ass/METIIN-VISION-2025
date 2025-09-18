@@ -193,9 +193,8 @@ def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
         else:
             log_func = logger.debug if resource in _OPTIONAL_YOLO_RESOURCES else logger.warning
             log_func(
-                "Klasa YOLO dla zasobu '%s' nie została znaleziona w modelu. Dostępne klasy: %s",
-                resource.value,
-                available,
+                f"Klasa YOLO dla zasobu '{resource.value}' nie została znaleziona w modelu. "
+                f"Dostępne klasy: {available}"
             )
 
     return mapping
@@ -210,13 +209,13 @@ def _initialize_yolo_model(device: str) -> None:
     try:
         yolo_checks()
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.warning("Weryfikacja środowiska YOLO zakończona ostrzeżeniem: %s", exc)
+        logger.warning(f"Weryfikacja środowiska YOLO zakończona ostrzeżeniem: {exc}")
 
     model_path = Path(MODELS_DIR) / YOLO_MODEL_FILENAME
     if not model_path.exists():
         logger.warning(
-            "Model YOLO WuKonga nie został znaleziony pod ścieżką %s – powracam do detekcji szablonowej.",
-            model_path,
+            f"Model YOLO WuKonga nie został znaleziony pod ścieżką {model_path} – "
+            "powracam do detekcji szablonowej."
         )
         return
 
@@ -229,14 +228,18 @@ def _initialize_yolo_model(device: str) -> None:
     try:
         model.to(device)
     except Exception as exc:  # pragma: no cover - CUDA availability varies
-        logger.warning("Nie można załadować modelu na urządzenie %s (%s). Używam CPU.", device, exc)
+        logger.warning(
+            f"Nie można załadować modelu na urządzenie {device} ({exc}). Używam CPU."
+        )
         model.to("cpu")
 
     _YOLO_MODEL = model
     _YOLO_CLASS_IDS = _resolve_yolo_class_map(model)
 
     if _YOLO_CLASS_IDS:
-        logger.info("Załadowano model YOLO WuKonga – zmapowano %d klas.", len(_YOLO_CLASS_IDS))
+        logger.info(
+            f"Załadowano model YOLO WuKonga – zmapowano {len(_YOLO_CLASS_IDS)} klas."
+        )
     else:
         logger.warning("Model YOLO WuKonga załadowany, lecz nie znaleziono żadnych zgodnych klas.")
 
