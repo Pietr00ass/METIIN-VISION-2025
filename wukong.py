@@ -380,7 +380,7 @@ def _monitor_stage(
     if not prompt_already_confirmed:
         _wait_for_stage_prompt(vision, stage, timeout)
 
-    prompt_seen = False
+    prompt_seen = prompt_already_confirmed
     last_progress: Optional[int] = None
     last_message = ""
 
