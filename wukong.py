@@ -365,6 +365,147 @@ def _make_basic_combat_action(
     return _action
 
 
+def _confirm_template_presence(
+    vision: VisionDetector,
+    resource: ResourceName,
+    label: str,
+    *,
+    threshold: float = 0.82,
+) -> None:
+    if resource.value not in vision.target_templates:
+        logger.debug(
+            "Pominięto wstępne potwierdzenie %s – brak szablonu '%s'.",
+            label,
+            resource.value,
+        )
+        return
+
+    frame = vision.capture_frame()
+    if frame is None:
+        logger.warning("Nie udało się pobrać klatki do potwierdzenia %s.", label)
+        return
+
+    detections = vision.locate_all_templates(
+        resource,
+        frame=frame,
+        threshold=threshold,
+    )
+    if detections:
+        logger.info("Potwierdzono obecność %s (detekcje: %d).", label, len(detections))
+    else:
+        logger.debug(
+            "Szablon '%s' dostępny, ale nie wykryto jeszcze %s.",
+            resource.value,
+            label,
+        )
+
+
+def _make_template_presence_callback(
+    vision: VisionDetector,
+    resource: ResourceName,
+    *,
+    label: str,
+    threshold: float = 0.82,
+    interval: float = 4.0,
+) -> Callable[[float], None]:
+    state = {"last_check": 0.0, "present": None, "missing_logged": False}
+
+    def _callback(now: float) -> None:
+        if resource.value not in vision.target_templates:
+            if not state["missing_logged"]:
+                logger.debug(
+                    "Pomijam monitorowanie %s – brak załadowanego szablonu '%s'.",
+                    label,
+                    resource.value,
+                )
+                state["missing_logged"] = True
+            return
+
+        if now - state["last_check"] < interval:
+            return
+
+        detections = vision.locate_all_templates(resource, threshold=threshold)
+        present = bool(detections)
+
+        if state["present"] is None:
+            if present:
+                logger.info("Wykryto %s.", label)
+            else:
+                logger.debug(
+                    "Szablon '%s' aktywny, ale %s nie są widoczne.",
+                    resource.value,
+                    label,
+                )
+        elif present != state["present"]:
+            if present:
+                logger.info("%s ponownie widoczne.", label.capitalize())
+            else:
+                logger.success("%s nie są już wykrywane.", label.capitalize())
+
+        state["present"] = present
+        state["last_check"] = now
+
+    return _callback
+
+
+def _make_template_count_callback(
+    vision: VisionDetector,
+    resource: ResourceName,
+    *,
+    label: str,
+    threshold: float = 0.82,
+    interval: float = 4.0,
+) -> Callable[[float], None]:
+    state = {"last_check": 0.0, "count": None, "missing_logged": False}
+
+    def _callback(now: float) -> None:
+        if resource.value not in vision.target_templates:
+            if not state["missing_logged"]:
+                logger.debug(
+                    "Pomijam monitorowanie liczby %s – brak szablonu '%s'.",
+                    label,
+                    resource.value,
+                )
+                state["missing_logged"] = True
+            return
+
+        if now - state["last_check"] < interval:
+            return
+
+        detections = vision.locate_all_templates(resource, threshold=threshold)
+        count = len(detections)
+
+        if state["count"] is None:
+            if count:
+                logger.info("Wykryto %d %s.", count, label)
+            else:
+                logger.debug(
+                    "Szablon '%s' aktywny, ale nie wykryto %s.",
+                    resource.value,
+                    label,
+                )
+        elif count != state["count"]:
+            if count < state["count"]:
+                logger.success(
+                    "Pozostało %d %s (poprzednio %d).",
+                    count,
+                    label,
+                    state["count"],
+                )
+            else:
+                logger.warning(
+                    "Liczba %s wzrosła z %d do %d.",
+                    label,
+                    state["count"],
+                    count,
+                )
+
+        state["count"] = count
+        state["last_check"] = now
+
+    return _callback
+
+
 def _monitor_stage(
     game: GameController,
     vision: VisionDetector,
@@ -633,6 +774,16 @@ def _handle_slay_first_wave(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_MOB,
+        "mobów pierwszej fali WuKonga",
+    )
+    mob_tracker = _make_template_presence_callback(
+        vision,
+        ResourceName.WUKONG_MOB,
+        label="mobów pierwszej fali WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -640,6 +791,7 @@ def _handle_slay_first_wave(
         timeout,
         attack_interval=0.8,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+        extra_callbacks=(mob_tracker,),
     )
 
 
@@ -649,6 +801,16 @@ def _handle_destroy_first_metins(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_METIN,
+        "kamieni Metin WuKonga",
+    )
+    metin_tracker = _make_template_count_callback(
+        vision,
+        ResourceName.WUKONG_METIN,
+        label="kamieni Metin WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -657,6 +819,7 @@ def _handle_destroy_first_metins(
         attack_interval=0.9,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
         progress_parser=_extract_remaining_count,
+        extra_callbacks=(metin_tracker,),
     )
 
 
@@ -666,6 +829,16 @@ def _handle_clear_second_wave(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_MOB,
+        "mobów drugiej fali WuKonga",
+    )
+    mob_tracker = _make_template_presence_callback(
+        vision,
+        ResourceName.WUKONG_MOB,
+        label="mobów drugiej fali WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -673,6 +846,7 @@ def _handle_clear_second_wave(
         timeout,
         attack_interval=0.8,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+        extra_callbacks=(mob_tracker,),
     )
 
 
@@ -744,6 +918,16 @@ def _handle_repel_three_waves(
     logger.info("Aktywuję pelerynę (F4), aby przyspieszyć pojawianie się fal.")
     game.tap_key(UserBind.MARMUREK)
 
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_MOB,
+        "przeciwników w falach WuKonga",
+    )
+    mob_tracker = _make_template_presence_callback(
+        vision,
+        ResourceName.WUKONG_MOB,
+        label="przeciwników w falach WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -753,6 +937,7 @@ def _handle_repel_three_waves(
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
         lure_interval=25.0,
         progress_parser=_extract_remaining_count,
+        extra_callbacks=(mob_tracker,),
     )
 
 
@@ -762,6 +947,16 @@ def _handle_destroy_second_metin(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_METIN,
+        "ostatnich kamieni Metin WuKonga",
+    )
+    metin_tracker = _make_template_count_callback(
+        vision,
+        ResourceName.WUKONG_METIN,
+        label="kamieni Metin WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -770,6 +965,7 @@ def _handle_destroy_second_metin(
         attack_interval=0.9,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
         progress_parser=_extract_remaining_count,
+        extra_callbacks=(metin_tracker,),
     )
 
 
@@ -795,6 +991,16 @@ def _handle_clear_final_wave(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_MOB,
+        "ostatnich przeciwników WuKonga",
+    )
+    mob_tracker = _make_template_presence_callback(
+        vision,
+        ResourceName.WUKONG_MOB,
+        label="ostatnich przeciwników WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -802,6 +1008,7 @@ def _handle_clear_final_wave(
         timeout,
         attack_interval=0.8,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+        extra_callbacks=(mob_tracker,),
     )
 
 
@@ -811,6 +1018,16 @@ def _handle_destroy_crimson_gourds(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_CRIMSON_GOURD,
+        "Karmazynowych Gurd",
+    )
+    gourd_tracker = _make_template_count_callback(
+        vision,
+        ResourceName.WUKONG_CRIMSON_GOURD,
+        label="Karmazynowych Gurd",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -819,6 +1036,7 @@ def _handle_destroy_crimson_gourds(
         attack_interval=0.85,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
         progress_parser=_extract_remaining_count,
+        extra_callbacks=(gourd_tracker,),
     )
 
 
@@ -828,6 +1046,16 @@ def _handle_defeat_wukong(
     stage: StageDefinition,
     timeout: float,
 ) -> None:
+    _confirm_template_presence(
+        vision,
+        ResourceName.WUKONG_MONKEY_KING,
+        "Małpiego Króla WuKonga",
+    )
+    boss_tracker = _make_template_presence_callback(
+        vision,
+        ResourceName.WUKONG_MONKEY_KING,
+        label="Małpiego Króla WuKonga",
+    )
     _run_combat_stage(
         game,
         vision,
@@ -835,6 +1063,7 @@ def _handle_defeat_wukong(
         timeout,
         attack_interval=0.65,
         skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+        extra_callbacks=(boss_tracker,),
     )
 
 

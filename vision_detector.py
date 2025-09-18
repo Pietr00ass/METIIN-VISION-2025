@@ -28,6 +28,10 @@ from settings import (
     WUKONG_PHOENIX_EGG_FPATH,
     WUKONG_RESTART_BUTTON_FPATH,
     WUKONG_RESTART_CONFIRM_FPATH,
+    WUKONG_METIN_TEMPLATE_FPATH,
+    WUKONG_MOB_TEMPLATE_FPATH,
+    WUKONG_CRIMSON_GOURD_TEMPLATE_FPATH,
+    WUKONG_MONKEY_KING_TEMPLATE_FPATH,
     BotBind,
     ResourceName,
     WINDOW_NOT_FOUND_EXIT_DELAY,
@@ -68,6 +72,18 @@ class VisionDetector:
         self._register_template(
             ResourceName.WUKONG_RESTART_CONFIRM,
             WUKONG_RESTART_CONFIRM_FPATH,
+            optional=True,
+        )
+        self._register_template(ResourceName.WUKONG_METIN, WUKONG_METIN_TEMPLATE_FPATH, optional=True)
+        self._register_template(ResourceName.WUKONG_MOB, WUKONG_MOB_TEMPLATE_FPATH, optional=True)
+        self._register_template(
+            ResourceName.WUKONG_CRIMSON_GOURD,
+            WUKONG_CRIMSON_GOURD_TEMPLATE_FPATH,
+            optional=True,
+        )
+        self._register_template(
+            ResourceName.WUKONG_MONKEY_KING,
+            WUKONG_MONKEY_KING_TEMPLATE_FPATH,
             optional=True,
         )
 
