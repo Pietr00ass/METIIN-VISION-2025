@@ -183,7 +183,6 @@ def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
     mapping: Dict[ResourceName, int] = {}
     missing: list[str] = []
     available = ", ".join(sorted(normalized))
-
     for resource in WUKONG_YOLO_RESOURCES:
         class_idx = normalized.get(resource.value.lower())
         if class_idx is None:
@@ -206,9 +205,7 @@ def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
             f"Model YOLO WuKonga nie zawiera żadnych rozpoznawalnych klas WuKonga. "
             f"Dostępne klasy: {available_display}."
         )
-
     return mapping
-
 
 def _initialize_yolo_model(device: str) -> None:
     global _YOLO_MODEL, _YOLO_CLASS_IDS
