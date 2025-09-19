@@ -995,7 +995,14 @@ class WuKongAutomation:
         threshold: float = 0.82,
         interval: float = 4.0,
     ) -> Callable[[float], None]:
-        state = {"last_check": 0.0, "present": None, "missing_logged": False}
+        state = {
+            "last_check": 0.0,
+            "present": None,
+            "missing_logged": False,
+            "absent_since": None,
+            "completion_grace": 3.0,
+            "detection_available": True,
+        }
 
         def _callback(now: float) -> None:
             if now - state["last_check"] < interval:
@@ -1015,6 +1022,9 @@ class WuKongAutomation:
                         resource.value,
                     )
                     state["missing_logged"] = True
+                state["detection_available"] = False
+                state["present"] = None
+                state["absent_since"] = None
                 state["last_check"] = now
                 return
 
@@ -1023,6 +1033,7 @@ class WuKongAutomation:
                 state["last_check"] = now
                 return
 
+            state["detection_available"] = True
             present = bool(detection.positions)
             method_verbose = self._detection_method_verbose_label(method)
 
@@ -1040,8 +1051,34 @@ class WuKongAutomation:
                 else:
                     logger.success("%s nie są już wykrywane (%s).", label.capitalize(), method_verbose)
 
+            if present:
+                state["absent_since"] = None
+            elif state["present"] is True or state["absent_since"] is None:
+                state["absent_since"] = now
+
             state["present"] = present
             state["last_check"] = now
+
+        def _completion_reason(now: float) -> Optional[str]:
+            if not state["detection_available"]:
+                return None
+            absent_since = state["absent_since"]
+            if absent_since is None:
+                return None
+            if now - absent_since >= state["completion_grace"]:
+                return f"Detekcja nie wykrywa już {label}."
+            return None
+
+        def _set_completion_grace(seconds: float) -> None:
+            state["completion_grace"] = max(0.0, seconds)
+
+        def _is_detection_available() -> bool:
+            return state["detection_available"]
+
+        _callback.completion_reason = _completion_reason  # type: ignore[attr-defined]
+        _callback.set_completion_grace = _set_completion_grace  # type: ignore[attr-defined]
+        _callback.detection_available = _is_detection_available  # type: ignore[attr-defined]
+        _callback.state = state  # type: ignore[attr-defined]
 
         return _callback
 
@@ -1053,7 +1090,15 @@ class WuKongAutomation:
         threshold: float = 0.82,
         interval: float = 4.0,
     ) -> Callable[[float], None]:
-        state = {"last_check": 0.0, "count": None, "missing_logged": False}
+        state = {
+            "last_check": 0.0,
+            "count": None,
+            "missing_logged": False,
+            "target_count": 0,
+            "cleared_since": None,
+            "completion_grace": 3.0,
+            "detection_available": True,
+        }
 
         def _callback(now: float) -> None:
             if now - state["last_check"] < interval:
@@ -1073,6 +1118,8 @@ class WuKongAutomation:
                         resource.value,
                     )
                     state["missing_logged"] = True
+                state["detection_available"] = False
+                state["cleared_since"] = None
                 state["last_check"] = now
                 return
 
@@ -1081,6 +1128,7 @@ class WuKongAutomation:
                 state["last_check"] = now
                 return
 
+            state["detection_available"] = True
             count = len(detection.positions)
             method_verbose = self._detection_method_verbose_label(method)
 
@@ -1110,8 +1158,45 @@ class WuKongAutomation:
                         method_verbose,
                     )
 
+            if count <= state["target_count"]:
+                if state["cleared_since"] is None:
+                    state["cleared_since"] = now
+            else:
+                state["cleared_since"] = None
+
             state["count"] = count
             state["last_check"] = now
+
+        def _set_completion_target(target: int) -> None:
+            state["target_count"] = target
+            if state["count"] is not None and state["count"] > target:
+                state["cleared_since"] = None
+
+        def _set_completion_grace(seconds: float) -> None:
+            state["completion_grace"] = max(0.0, seconds)
+
+        def _completion_reason(now: float) -> Optional[str]:
+            if not state["detection_available"]:
+                return None
+            cleared_since = state["cleared_since"]
+            if cleared_since is None:
+                return None
+            if now - cleared_since >= state["completion_grace"]:
+                if state["target_count"] > 0:
+                    return (
+                        f"Detekcja potwierdza osiągnięcie limitu {label} (<= {state['target_count']})."
+                    )
+                return f"Detekcja potwierdza brak {label}."
+            return None
+
+        def _is_detection_available() -> bool:
+            return state["detection_available"]
+
+        _callback.set_completion_target = _set_completion_target  # type: ignore[attr-defined]
+        _callback.set_completion_grace = _set_completion_grace  # type: ignore[attr-defined]
+        _callback.completion_reason = _completion_reason  # type: ignore[attr-defined]
+        _callback.detection_available = _is_detection_available  # type: ignore[attr-defined]
+        _callback.state = state  # type: ignore[attr-defined]
 
         return _callback
 
@@ -1124,6 +1209,7 @@ class WuKongAutomation:
         progress_parser: Optional[Callable[[str], Optional[int]]] = None,
         completion_keywords: Optional[Sequence[str]] = None,
         prompt_already_confirmed: bool = False,
+        completion_check: Optional[Callable[[float], Optional[str]]] = None,
     ) -> float:
         stage_start = perf_counter()
         if not prompt_already_confirmed:
@@ -1146,6 +1232,17 @@ class WuKongAutomation:
 
             if action_callback is not None:
                 action_callback(now)
+
+            if completion_check is not None:
+                completion_message = completion_check(now)
+                if completion_message:
+                    logger.info(completion_message)
+                    logger.debug(
+                        "Ukończono etap na podstawie detekcji obiektów (bez analizy komunikatów)."
+                    )
+                    elapsed = now - stage_start
+                    logger.success("Etap '%s' ukończony w %.1fs.", stage.title, elapsed)
+                    return elapsed
 
             message = self._capture_dungeon_message()
             if message:
@@ -1301,6 +1398,7 @@ class WuKongAutomation:
         extra_callbacks: Optional[Sequence[Callable[[float], None]]] = None,
         progress_parser: Optional[Callable[[str], Optional[int]]] = None,
         prompt_confirmed: bool = False,
+        completion_check: Optional[Callable[[float], Optional[str]]] = None,
     ) -> float:
         self._prepare_for_combat()
         self.game.start_attack()
@@ -1319,6 +1417,7 @@ class WuKongAutomation:
                 completion_keywords=stage.completion_keywords,
                 progress_parser=progress_parser,
                 prompt_already_confirmed=prompt_confirmed,
+                completion_check=completion_check,
             )
         finally:
             self.game.stop_attack()
@@ -1378,6 +1477,11 @@ class WuKongAutomation:
     # ------------------------------------------------------------------
 
     def _handle_slay_first_wave(self, stage: StageDefinition, timeout: float) -> float:
+        mob_tracker = self._make_template_presence_callback(
+            ResourceName.WUKONG_MOB,
+            label="przeciwników WuKonga",
+        )
+        mob_tracker.set_completion_grace(5.0)
         mob_engage = self._make_engage_callback(
             ResourceName.WUKONG_MOB,
             label="przeciwników WuKonga",
@@ -1387,8 +1491,9 @@ class WuKongAutomation:
             timeout,
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(mob_engage,),
+            extra_callbacks=(mob_tracker, mob_engage),
             progress_parser=self._extract_remaining_count,
+            completion_check=mob_tracker.completion_reason,
         )
 
     def _handle_destroy_first_metins(self, stage: StageDefinition, timeout: float) -> float:
@@ -1400,6 +1505,8 @@ class WuKongAutomation:
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
         )
+        metin_tracker.set_completion_target(0)
+        metin_tracker.set_completion_grace(4.0)
         metin_engage = self._make_engage_callback(
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
@@ -1411,6 +1518,7 @@ class WuKongAutomation:
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             extra_callbacks=(metin_tracker, metin_engage),
             progress_parser=self._extract_remaining_count,
+            completion_check=metin_tracker.completion_reason,
         )
 
     def _handle_clear_second_wave(self, stage: StageDefinition, timeout: float) -> float:
@@ -1422,6 +1530,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="mobów drugiej fali WuKonga",
         )
+        mob_tracker.set_completion_grace(5.0)
         mob_engage = self._make_engage_callback(
             ResourceName.WUKONG_MOB,
             label="mobów drugiej fali WuKonga",
@@ -1432,6 +1541,7 @@ class WuKongAutomation:
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             extra_callbacks=(mob_tracker, mob_engage),
+            completion_check=mob_tracker.completion_reason,
         )
 
     def _handle_defeat_cloud_guardian(self, stage: StageDefinition, timeout: float) -> float:
@@ -1443,6 +1553,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_CLOUD_GUARDIAN,
             label="Obrońcę Chmur WuKonga",
         )
+        guardian_tracker.set_completion_grace(5.0)
         guardian_engage = self._make_engage_callback(
             ResourceName.WUKONG_CLOUD_GUARDIAN,
             label="Obrońcę Chmur WuKonga",
@@ -1453,6 +1564,7 @@ class WuKongAutomation:
             attack_interval=0.7,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             extra_callbacks=(guardian_tracker, guardian_engage),
+            completion_check=guardian_tracker.completion_reason,
         )
 
     def _handle_place_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> float:
@@ -1464,6 +1576,12 @@ class WuKongAutomation:
             self._use_phoenix_eggs()
             last_egg_usage["time"] = now
 
+        egg_tracker = self._make_template_count_callback(
+            ResourceName.WUKONG_PHOENIX_EGG,
+            label="jaj Feniksa WuKonga",
+        )
+        egg_tracker.set_completion_target(0)
+        egg_tracker.set_completion_grace(4.0)
         mob_engage = self._make_engage_callback(
             ResourceName.WUKONG_MOB,
             label="przeciwników WuKonga",
@@ -1473,11 +1591,18 @@ class WuKongAutomation:
             timeout,
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(_egg_callback, mob_engage),
+            extra_callbacks=(_egg_callback, egg_tracker, mob_engage),
             progress_parser=self._extract_remaining_count,
+            completion_check=egg_tracker.completion_reason,
         )
 
     def _handle_destroy_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> float:
+        egg_tracker = self._make_template_count_callback(
+            ResourceName.WUKONG_PHOENIX_EGG,
+            label="jaj Feniksa WuKonga",
+        )
+        egg_tracker.set_completion_target(0)
+        egg_tracker.set_completion_grace(4.0)
         egg_engage = self._make_engage_callback(
             ResourceName.WUKONG_PHOENIX_EGG,
             label="jaj Feniksa WuKonga",
@@ -1491,8 +1616,9 @@ class WuKongAutomation:
             timeout,
             attack_interval=0.75,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(egg_engage, mob_engage),
+            extra_callbacks=(egg_tracker, egg_engage, mob_engage),
             progress_parser=self._extract_remaining_count,
+            completion_check=egg_tracker.completion_reason,
         )
 
     def _handle_repel_three_waves(self, stage: StageDefinition, timeout: float) -> float:
@@ -1507,6 +1633,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="przeciwników w falach WuKonga",
         )
+        mob_tracker.set_completion_grace(6.0)
         mob_engage = self._make_engage_callback(
             ResourceName.WUKONG_MOB,
             label="przeciwników w falach WuKonga",
@@ -1519,6 +1646,7 @@ class WuKongAutomation:
             lure_interval=25.0,
             progress_parser=self._extract_remaining_count,
             extra_callbacks=(mob_tracker, mob_engage),
+            completion_check=mob_tracker.completion_reason,
         )
 
     def _handle_destroy_second_metin(self, stage: StageDefinition, timeout: float) -> float:
@@ -1530,6 +1658,8 @@ class WuKongAutomation:
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
         )
+        metin_tracker.set_completion_target(0)
+        metin_tracker.set_completion_grace(4.0)
         metin_engage = self._make_engage_callback(
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
@@ -1541,6 +1671,7 @@ class WuKongAutomation:
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             progress_parser=self._extract_remaining_count,
             extra_callbacks=(metin_tracker, metin_engage),
+            completion_check=metin_tracker.completion_reason,
         )
 
     def _handle_defeat_flaming_phoenix(self, stage: StageDefinition, timeout: float) -> float:
@@ -1552,6 +1683,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_FLAMING_PHOENIX,
             label="Płomiennego Feniksa WuKonga",
         )
+        phoenix_tracker.set_completion_grace(5.0)
         phoenix_engage = self._make_engage_callback(
             ResourceName.WUKONG_FLAMING_PHOENIX,
             label="Płomiennego Feniksa WuKonga",
@@ -1562,6 +1694,7 @@ class WuKongAutomation:
             attack_interval=0.7,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             extra_callbacks=(phoenix_tracker, phoenix_engage),
+            completion_check=phoenix_tracker.completion_reason,
         )
 
     def _handle_clear_final_wave(self, stage: StageDefinition, timeout: float) -> float:
@@ -1573,6 +1706,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="ostatnich przeciwników WuKonga",
         )
+        mob_tracker.set_completion_grace(5.0)
         mob_engage = self._make_engage_callback(
             ResourceName.WUKONG_MOB,
             label="ostatnich przeciwników WuKonga",
@@ -1583,6 +1717,7 @@ class WuKongAutomation:
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             extra_callbacks=(mob_tracker, mob_engage),
+            completion_check=mob_tracker.completion_reason,
         )
 
     def _handle_destroy_crimson_gourds(self, stage: StageDefinition, timeout: float) -> float:
@@ -1594,6 +1729,8 @@ class WuKongAutomation:
             ResourceName.WUKONG_CRIMSON_GOURD,
             label="Karmazynowych Gurd",
         )
+        gourd_tracker.set_completion_target(0)
+        gourd_tracker.set_completion_grace(4.0)
         gourd_engage = self._make_engage_callback(
             ResourceName.WUKONG_CRIMSON_GOURD,
             label="Karmazynowych Gurd",
@@ -1605,6 +1742,7 @@ class WuKongAutomation:
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             progress_parser=self._extract_remaining_count,
             extra_callbacks=(gourd_tracker, gourd_engage),
+            completion_check=gourd_tracker.completion_reason,
         )
 
     def _handle_defeat_wukong(self, stage: StageDefinition, timeout: float) -> float:
@@ -1616,6 +1754,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MONKEY_KING,
             label="Małpiego Króla WuKonga",
         )
+        boss_tracker.set_completion_grace(5.0)
         boss_engage = self._make_engage_callback(
             ResourceName.WUKONG_MONKEY_KING,
             label="Małpiego Króla WuKonga",
@@ -1626,6 +1765,7 @@ class WuKongAutomation:
             attack_interval=0.65,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             extra_callbacks=(boss_tracker, boss_engage),
+            completion_check=boss_tracker.completion_reason,
         )
 
     def _handle_restart_expedition(self, stage: StageDefinition, timeout: float) -> float:
