@@ -115,6 +115,7 @@ DETECTION_METHOD_UNAVAILABLE = "unavailable"
 
 REMAINING_PATTERN = re.compile(r"pozostał[oa]?\s*:?\s*(\d+)")
 PROMPT_WAIT_LIMIT = 15.0
+CLOAK_REFRESH_INTERVAL = 45.0
 
 DEFAULT_STAGE_TIMEOUTS: Tuple[float, ...] = (
     90,
@@ -276,6 +277,8 @@ class WuKongAutomation:
         )
 
         self._buffs_initialized = False
+        self._cloak_initialized = False
+        self._last_cloak_activation = 0.0
         self._yolo_model: YOLO | None = None
         self._yolo_class_ids: Dict[ResourceName, int] = {}
 
@@ -880,6 +883,20 @@ class WuKongAutomation:
         self.game.toggle_passive_skills(reset_animation=False)
         self._buffs_initialized = True
 
+    def _ensure_cloak_active(self, now: float) -> None:
+        if not self._cloak_initialized or now - self._last_cloak_activation >= CLOAK_REFRESH_INTERVAL:
+            if not self._cloak_initialized:
+                logger.info(
+                    "Aktywuję pelerynę (F4), aby przyciągać przeciwników przez całą wyprawę."
+                )
+            else:
+                logger.debug(
+                    "Odświeżam działanie peleryny (F4), aby utrzymać efekt przez całą wyprawę."
+                )
+            self.game.tap_key(UserBind.MARMUREK)
+            self._cloak_initialized = True
+            self._last_cloak_activation = now
+
     def _make_basic_combat_action(
         self,
         *,
@@ -1113,8 +1130,10 @@ class WuKongAutomation:
             self._wait_for_stage_prompt(stage, timeout)
 
         prompt_seen = prompt_already_confirmed
+        prompt_confirmed_via_keywords = prompt_already_confirmed
         last_progress: Optional[int] = None
         last_message = ""
+        current_prompt_message: Optional[str] = None
 
         while True:
             now = perf_counter()
@@ -1122,6 +1141,8 @@ class WuKongAutomation:
                 raise StageTimeoutError(
                     f"Etap '{stage.title}' przekroczył limit {timeout:.0f}s."
                 )
+
+            self._ensure_cloak_active(now)
 
             if action_callback is not None:
                 action_callback(now)
@@ -1132,18 +1153,48 @@ class WuKongAutomation:
                     logger.debug("Komunikat lochów: %s", message)
                     last_message = message
 
-                if self._message_contains_keywords(message, stage.prompt_keywords):
+                matches_prompt_keywords = self._message_contains_keywords(
+                    message, stage.prompt_keywords
+                )
+
+                if matches_prompt_keywords:
+                    if not prompt_confirmed_via_keywords and not prompt_already_confirmed:
+                        logger.debug(
+                            "Potwierdzono komunikat etapu na podstawie słów kluczowych."
+                        )
                     prompt_seen = True
+                    prompt_confirmed_via_keywords = True
+                    if current_prompt_message != message:
+                        current_prompt_message = message
                     if progress_parser is not None:
                         remaining = progress_parser(message)
                         if remaining is not None and remaining != last_progress:
                             logger.info("Pozostało: %s", remaining)
                             last_progress = remaining
-                elif prompt_seen:
-                    if completion_keywords and self._message_contains_keywords(message, completion_keywords):
+                elif current_prompt_message is None:
+                    current_prompt_message = message
+                    prompt_seen = True
+                    if not prompt_confirmed_via_keywords:
+                        logger.debug(
+                            "Zapamiętano początkowy komunikat etapu bez dopasowania słów kluczowych: %s",
+                            message,
+                        )
+
+                if (
+                    prompt_seen
+                    and current_prompt_message is not None
+                    and message != current_prompt_message
+                ):
+                    if completion_keywords and self._message_contains_keywords(
+                        message, completion_keywords
+                    ):
                         logger.info("Wykryto komunikat kolejnego etapu: %s", message)
                     else:
                         logger.info("Komunikat etapu uległ zmianie: %s", message)
+                        if not prompt_confirmed_via_keywords:
+                            logger.debug(
+                                "Ukończono etap na podstawie zmiany komunikatu (ścieżka awaryjna)."
+                            )
                     elapsed = now - stage_start
                     logger.success("Etap '%s' ukończony w %.1fs.", stage.title, elapsed)
                     return elapsed
@@ -1445,8 +1496,8 @@ class WuKongAutomation:
         )
 
     def _handle_repel_three_waves(self, stage: StageDefinition, timeout: float) -> float:
-        logger.info("Aktywuję pelerynę (F4), aby przyspieszyć pojawianie się fal.")
-        self.game.tap_key(UserBind.MARMUREK)
+        logger.debug("Potwierdzam aktywną pelerynę (F4) przed rozpoczęciem fal.")
+        self._ensure_cloak_active(perf_counter())
 
         self._confirm_template_presence(
             ResourceName.WUKONG_MOB,
