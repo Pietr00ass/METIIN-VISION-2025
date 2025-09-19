@@ -89,6 +89,16 @@ WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
     ResourceName.WUKONG_FLAMING_PHOENIX: ("wukong_flaming_phoenix", "plomienny_feniks"),
 }
 
+WUKONG_RESOURCE_LABELS: Dict[ResourceName, str] = {
+    ResourceName.WUKONG_MOB: "przeciwników WuKonga",
+    ResourceName.WUKONG_METIN: "kamieni Metin WuKonga",
+    ResourceName.WUKONG_CRIMSON_GOURD: "Karmazynowych Gurd WuKonga",
+    ResourceName.WUKONG_MONKEY_KING: "Małpiego Króla WuKonga",
+    ResourceName.WUKONG_CLOUD_GUARDIAN: "Obrońcę Chmur WuKonga",
+    ResourceName.WUKONG_PHOENIX_EGG: "jaj Feniksa WuKonga",
+    ResourceName.WUKONG_FLAMING_PHOENIX: "Płomiennego Feniksa WuKonga",
+}
+
 _OPTIONAL_YOLO_RESOURCES = {ResourceName.WUKONG_PHOENIX_EGG}
 
 
@@ -286,6 +296,8 @@ class WuKongAutomation:
             "defeat_wukong": self._handle_defeat_wukong,
             "restart_expedition": self._handle_restart_expedition,
         }
+
+        self._detection_log_state: Dict[ResourceName, Tuple[str, int]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -603,12 +615,16 @@ class WuKongAutomation:
         if frame is None:
             frame = self.vision.capture_frame()
         if frame is None:
-            return DetectionResult(tuple(), DETECTION_METHOD_FRAME_MISSING)
+            detection = DetectionResult(tuple(), DETECTION_METHOD_FRAME_MISSING)
+            self._log_detection_result(resource, detection)
+            return detection
 
         if self._yolo_model is not None and self._get_yolo_class_id(resource) is not None:
             detections = self._detect_with_yolo(frame, resource, threshold=threshold)
             if detections:
-                return DetectionResult(detections, DETECTION_METHOD_YOLO)
+                detection = DetectionResult(detections, DETECTION_METHOD_YOLO)
+                self._log_detection_result(resource, detection)
+                return detection
             if resource.value in self.vision.target_templates:
                 template_detections = self.vision.locate_all_templates(
                     resource,
@@ -620,8 +636,12 @@ class WuKongAutomation:
                         "Model YOLO nie wykrył '%s' – korzystam z klasycznego wzorca jako wsparcia.",
                         resource.value,
                     )
-                    return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
-            return DetectionResult(tuple(), DETECTION_METHOD_YOLO)
+                    detection = DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+                    self._log_detection_result(resource, detection)
+                    return detection
+            detection = DetectionResult(tuple(), DETECTION_METHOD_YOLO)
+            self._log_detection_result(resource, detection)
+            return detection
 
         if resource.value in self.vision.target_templates:
             template_detections = self.vision.locate_all_templates(
@@ -629,9 +649,13 @@ class WuKongAutomation:
                 frame=frame,
                 threshold=fallback_threshold,
             )
-            return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+            detection = DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+            self._log_detection_result(resource, detection)
+            return detection
 
-        return DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
+        detection = DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
+        self._log_detection_result(resource, detection)
+        return detection
 
     @staticmethod
     def _detection_method_verbose_label(method: str) -> str:
@@ -640,6 +664,41 @@ class WuKongAutomation:
         if method == DETECTION_METHOD_TEMPLATE:
             return "szablonem"
         return "niezidentyfikowanym detektorem"
+
+    def _log_detection_result(
+        self,
+        resource: ResourceName,
+        detection: DetectionResult,
+    ) -> None:
+        label = WUKONG_RESOURCE_LABELS.get(resource)
+        if label is None:
+            return
+
+        count = len(detection.positions)
+        state = (detection.method, count)
+        if self._detection_log_state.get(resource) == state:
+            return
+
+        self._detection_log_state[resource] = state
+
+        method = detection.method
+        if method == DETECTION_METHOD_FRAME_MISSING:
+            logger.warning("Nie udało się pobrać klatki do detekcji %s.", label)
+            return
+
+        if method == DETECTION_METHOD_UNAVAILABLE:
+            logger.debug(
+                "Detekcja %s jest niedostępna – brak odpowiedniego detektora.",
+                label,
+            )
+            return
+
+        method_verbose = self._detection_method_verbose_label(method)
+
+        if count:
+            logger.info("Wykryto %d %s (%s).", count, label, method_verbose)
+        else:
+            logger.debug("Nie wykryto %s (%s).", label, method_verbose)
 
     def _get_screen_center_global(self) -> Tuple[int, int]:
         """Return the global coordinates of the game window center."""
