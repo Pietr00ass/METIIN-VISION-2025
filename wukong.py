@@ -81,17 +81,15 @@ YOLO_MODEL_FILENAME = "wukong.pt"
 DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.6
 DEFAULT_YOLO_DEVICE = "cuda:0"
 
-WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
-    ResourceName.WUKONG_MOB: ("moby",),
-    ResourceName.WUKONG_METIN: ("metin",),
-    ResourceName.WUKONG_CRIMSON_GOURD: ("karmazynowy_gurd",),
-    ResourceName.WUKONG_MONKEY_KING: ("wukong",),
-    ResourceName.WUKONG_CLOUD_GUARDIAN: ("obronca_chmur",),
-    ResourceName.WUKONG_PHOENIX_EGG: ("jaja_feniksa",),
-    ResourceName.WUKONG_FLAMING_PHOENIX: ("plomienny_feniks",),
-}
-
-_OPTIONAL_YOLO_RESOURCES = {ResourceName.WUKONG_PHOENIX_EGG}
+WUKONG_YOLO_RESOURCES: Tuple[ResourceName, ...] = (
+    ResourceName.WUKONG_MOB,
+    ResourceName.WUKONG_METIN,
+    ResourceName.WUKONG_CRIMSON_GOURD,
+    ResourceName.WUKONG_MONKEY_KING,
+    ResourceName.WUKONG_CLOUD_GUARDIAN,
+    ResourceName.WUKONG_PHOENIX_EGG,
+    ResourceName.WUKONG_FLAMING_PHOENIX,
+)
 
 
 class DetectionResult(NamedTuple):
@@ -183,22 +181,31 @@ def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
         return {}
 
     mapping: Dict[ResourceName, int] = {}
+    missing: list[str] = []
     available = ", ".join(sorted(normalized))
-    for resource, aliases in WUKONG_YOLO_ALIASES.items():
-        for alias in aliases:
-            class_idx = normalized.get(alias.lower())
-            if class_idx is not None:
-                mapping[resource] = class_idx
-                break
-        else:
-            log_func = logger.debug if resource in _OPTIONAL_YOLO_RESOURCES else logger.warning
-            log_func(
-                f"Klasa YOLO dla zasobu '{resource.value}' nie została znaleziona w modelu. "
-                f"Dostępne klasy: {available}"
-            )
+    for resource in WUKONG_YOLO_RESOURCES:
+        class_idx = normalized.get(resource.value.lower())
+        if class_idx is None:
+            missing.append(resource.value)
+            continue
+        mapping[resource] = class_idx
 
+    available_display = available if available else "<brak>"
+
+    logger.info(f"Klasy dostępne w modelu YOLO WuKonga: {available_display}.")
+
+    if missing:
+        logger.warning(
+            f"Model YOLO WuKonga nie zawiera klas: {', '.join(sorted(missing))}. "
+            f"Dostępne klasy: {available_display}."
+        )
+
+    if not mapping:
+        logger.warning(
+            f"Model YOLO WuKonga nie zawiera żadnych rozpoznawalnych klas WuKonga. "
+            f"Dostępne klasy: {available_display}."
+        )
     return mapping
-
 
 def _initialize_yolo_model(device: str) -> None:
     global _YOLO_MODEL, _YOLO_CLASS_IDS
@@ -314,40 +321,22 @@ def _detect_resource_positions(
     frame: Optional[np.ndarray] = None,
     threshold: Optional[float] = None,
 ) -> DetectionResult:
-    fallback_threshold = threshold if threshold is not None else 0.85
-
     if frame is None:
         frame = vision.capture_frame()
     if frame is None:
         return DetectionResult(tuple(), DETECTION_METHOD_FRAME_MISSING)
 
-    if _YOLO_MODEL is not None and _get_yolo_class_id(resource) is not None:
-        detections = _detect_with_yolo(vision, frame, resource, threshold=threshold)
-        if detections:
-            return DetectionResult(detections, DETECTION_METHOD_YOLO)
-        if resource.value in vision.target_templates:
-            template_detections = vision.locate_all_templates(
-                resource,
-                frame=frame,
-                threshold=fallback_threshold,
-            )
-            if template_detections:
-                logger.debug(
-                    "Model YOLO nie wykrył '%s' – korzystam z klasycznego wzorca jako wsparcia.",
-                    resource.value,
-                )
-                return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
-        return DetectionResult(tuple(), DETECTION_METHOD_YOLO)
+    if _YOLO_MODEL is None:
+        return DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
 
-    if resource.value in vision.target_templates:
-        template_detections = vision.locate_all_templates(
-            resource,
-            frame=frame,
-            threshold=fallback_threshold,
-        )
-        return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+    if _get_yolo_class_id(resource) is None:
+        return DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
 
-    return DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
+    detections = _detect_with_yolo(vision, frame, resource, threshold=threshold)
+    if detections:
+        return DetectionResult(detections, DETECTION_METHOD_YOLO)
+
+    return DetectionResult(tuple(), DETECTION_METHOD_YOLO)
 
 
 def _detection_method_verbose_label(method: str) -> str:
@@ -619,18 +608,20 @@ def _confirm_template_presence(
         )
         return
 
+    method_verbose = _detection_method_verbose_label(method)
+
     if detection.positions:
         logger.info(
             "Potwierdzono obecność %s (%s; detekcje: %d).",
             label,
-            _detection_method_verbose_label(method),
+            method_verbose,
             len(detection.positions),
         )
     else:
         if method == DETECTION_METHOD_YOLO:
-            logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+            logger.debug(f"Detekcja YOLO nie odnalazła jeszcze {label}.")
         else:
-            logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
+            logger.debug(f"Detekcja ({method_verbose}) nie odnalazła jeszcze {label}.")
 
 
 def _make_template_presence_callback(
@@ -678,9 +669,9 @@ def _make_template_presence_callback(
                 logger.info("Wykryto %s (%s).", label, method_verbose)
             else:
                 if method == DETECTION_METHOD_YOLO:
-                    logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+                    logger.debug(f"Detekcja YOLO nie odnalazła jeszcze {label}.")
                 else:
-                    logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
+                    logger.debug(f"Detekcja ({method_verbose}) nie odnalazła jeszcze {label}.")
         elif present != state["present"]:
             if present:
                 logger.info("%s ponownie widoczne (%s).", label.capitalize(), method_verbose)
@@ -738,9 +729,9 @@ def _make_template_count_callback(
                 logger.info("Wykryto %d %s (%s).", count, label, method_verbose)
             else:
                 if method == DETECTION_METHOD_YOLO:
-                    logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+                    logger.debug(f"Detekcja YOLO nie odnalazła jeszcze {label}.")
                 else:
-                    logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
+                    logger.debug(f"Detekcja ({method_verbose}) nie odnalazła jeszcze {label}.")
         elif count != state["count"]:
             if count < state["count"]:
                 logger.success(
