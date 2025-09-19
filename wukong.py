@@ -641,6 +641,92 @@ class WuKongAutomation:
             return "szablonem"
         return "niezidentyfikowanym detektorem"
 
+    def _get_screen_center_global(self) -> Tuple[int, int]:
+        """Return the global coordinates of the game window center."""
+
+        return self.vision.get_global_pos(self.vision.center)
+
+    def _make_engage_callback(
+        self,
+        resource: ResourceName,
+        *,
+        label: str,
+        threshold: Optional[float] = None,
+        detection_interval: float = 2.0,
+        click_cooldown: float = 2.0,
+    ) -> Callable[[float], None]:
+        """Create a callback that keeps the character moving towards ``resource``.
+
+        The callback relies on YOLO/template detections to find interesting
+        objects on the screen.  When a detection is available, it clicks the
+        closest match to the center of the screen which makes the character
+        move towards the target instead of idling in place.
+        """
+
+        center_global = self._get_screen_center_global()
+        state = {
+            "next_attempt": 0.0,
+            "last_click": 0.0,
+            "last_target": None,
+            "unavailable_logged": False,
+        }
+
+        def _callback(now: float) -> None:
+            if now < state["next_attempt"]:
+                return
+
+            detection = self._detect_resource_positions(
+                resource,
+                threshold=threshold,
+            )
+            state["next_attempt"] = now + detection_interval
+
+            method = detection.method
+            if method == DETECTION_METHOD_UNAVAILABLE:
+                if not state["unavailable_logged"]:
+                    logger.debug(
+                        "Automatyczne namierzanie %s niedostępne – brak detektora dla '%s'.",
+                        label,
+                        resource.value,
+                    )
+                    state["unavailable_logged"] = True
+                return
+
+            state["unavailable_logged"] = False
+
+            positions = detection.positions
+            if not positions:
+                method_verbose = self._detection_method_verbose_label(method)
+                logger.debug(
+                    "Nie udało się zlokalizować %s podczas automatycznego namierzania (%s).",
+                    label,
+                    method_verbose,
+                )
+                return
+
+            target = min(
+                positions,
+                key=lambda pos: (pos[0] - center_global[0]) ** 2 + (pos[1] - center_global[1]) ** 2,
+            )
+            method_verbose = self._detection_method_verbose_label(method)
+
+            should_click = False
+            if state["last_target"] != target:
+                logger.info("Namierzono %s – przemieszczam się do celu (%s).", label, method_verbose)
+                should_click = True
+            elif now - state["last_click"] >= click_cooldown:
+                logger.debug("Odświeżam ruch w kierunku %s (%s).", label, method_verbose)
+                should_click = True
+
+            if not should_click:
+                return
+
+            self.game.click_at(target)
+            state["last_target"] = target
+            state["last_click"] = now
+
+        return _callback
+
     # ------------------------------------------------------------------
     # Text helpers
     # ------------------------------------------------------------------
@@ -1137,11 +1223,16 @@ class WuKongAutomation:
     # ------------------------------------------------------------------
 
     def _handle_slay_first_wave(self, stage: StageDefinition, timeout: float) -> None:
+        mob_engage = self._make_engage_callback(
+            ResourceName.WUKONG_MOB,
+            label="przeciwników WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(mob_engage,),
             progress_parser=self._extract_remaining_count,
         )
 
@@ -1154,12 +1245,16 @@ class WuKongAutomation:
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
         )
+        metin_engage = self._make_engage_callback(
+            ResourceName.WUKONG_METIN,
+            label="kamieni Metin WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.9,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(metin_tracker,),
+            extra_callbacks=(metin_tracker, metin_engage),
             progress_parser=self._extract_remaining_count,
         )
 
@@ -1172,12 +1267,16 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="mobów drugiej fali WuKonga",
         )
+        mob_engage = self._make_engage_callback(
+            ResourceName.WUKONG_MOB,
+            label="mobów drugiej fali WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(mob_tracker,),
+            extra_callbacks=(mob_tracker, mob_engage),
         )
 
     def _handle_defeat_cloud_guardian(self, stage: StageDefinition, timeout: float) -> None:
@@ -1189,12 +1288,16 @@ class WuKongAutomation:
             ResourceName.WUKONG_CLOUD_GUARDIAN,
             label="Obrońcę Chmur WuKonga",
         )
+        guardian_engage = self._make_engage_callback(
+            ResourceName.WUKONG_CLOUD_GUARDIAN,
+            label="Obrońcę Chmur WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.7,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(guardian_tracker,),
+            extra_callbacks=(guardian_tracker, guardian_engage),
         )
 
     def _handle_place_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> None:
@@ -1206,21 +1309,34 @@ class WuKongAutomation:
             self._use_phoenix_eggs()
             last_egg_usage["time"] = now
 
+        mob_engage = self._make_engage_callback(
+            ResourceName.WUKONG_MOB,
+            label="przeciwników WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(_egg_callback,),
+            extra_callbacks=(_egg_callback, mob_engage),
             progress_parser=self._extract_remaining_count,
         )
 
     def _handle_destroy_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> None:
+        egg_engage = self._make_engage_callback(
+            ResourceName.WUKONG_PHOENIX_EGG,
+            label="jaj Feniksa WuKonga",
+        )
+        mob_engage = self._make_engage_callback(
+            ResourceName.WUKONG_MOB,
+            label="przeciwników WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.75,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(egg_engage, mob_engage),
             progress_parser=self._extract_remaining_count,
         )
 
@@ -1236,6 +1352,10 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="przeciwników w falach WuKonga",
         )
+        mob_engage = self._make_engage_callback(
+            ResourceName.WUKONG_MOB,
+            label="przeciwników w falach WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
@@ -1243,7 +1363,7 @@ class WuKongAutomation:
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             lure_interval=25.0,
             progress_parser=self._extract_remaining_count,
-            extra_callbacks=(mob_tracker,),
+            extra_callbacks=(mob_tracker, mob_engage),
         )
 
     def _handle_destroy_second_metin(self, stage: StageDefinition, timeout: float) -> None:
@@ -1255,13 +1375,17 @@ class WuKongAutomation:
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
         )
+        metin_engage = self._make_engage_callback(
+            ResourceName.WUKONG_METIN,
+            label="kamieni Metin WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.9,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             progress_parser=self._extract_remaining_count,
-            extra_callbacks=(metin_tracker,),
+            extra_callbacks=(metin_tracker, metin_engage),
         )
 
     def _handle_defeat_flaming_phoenix(self, stage: StageDefinition, timeout: float) -> None:
@@ -1273,12 +1397,16 @@ class WuKongAutomation:
             ResourceName.WUKONG_FLAMING_PHOENIX,
             label="Płomiennego Feniksa WuKonga",
         )
+        phoenix_engage = self._make_engage_callback(
+            ResourceName.WUKONG_FLAMING_PHOENIX,
+            label="Płomiennego Feniksa WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.7,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(phoenix_tracker,),
+            extra_callbacks=(phoenix_tracker, phoenix_engage),
         )
 
     def _handle_clear_final_wave(self, stage: StageDefinition, timeout: float) -> None:
@@ -1290,12 +1418,16 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="ostatnich przeciwników WuKonga",
         )
+        mob_engage = self._make_engage_callback(
+            ResourceName.WUKONG_MOB,
+            label="ostatnich przeciwników WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(mob_tracker,),
+            extra_callbacks=(mob_tracker, mob_engage),
         )
 
     def _handle_destroy_crimson_gourds(self, stage: StageDefinition, timeout: float) -> None:
@@ -1307,13 +1439,17 @@ class WuKongAutomation:
             ResourceName.WUKONG_CRIMSON_GOURD,
             label="Karmazynowych Gurd",
         )
+        gourd_engage = self._make_engage_callback(
+            ResourceName.WUKONG_CRIMSON_GOURD,
+            label="Karmazynowych Gurd",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.85,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
             progress_parser=self._extract_remaining_count,
-            extra_callbacks=(gourd_tracker,),
+            extra_callbacks=(gourd_tracker, gourd_engage),
         )
 
     def _handle_defeat_wukong(self, stage: StageDefinition, timeout: float) -> None:
@@ -1325,12 +1461,16 @@ class WuKongAutomation:
             ResourceName.WUKONG_MONKEY_KING,
             label="Małpiego Króla WuKonga",
         )
+        boss_engage = self._make_engage_callback(
+            ResourceName.WUKONG_MONKEY_KING,
+            label="Małpiego Króla WuKonga",
+        )
         self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.65,
             skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-            extra_callbacks=(boss_tracker,),
+            extra_callbacks=(boss_tracker, boss_engage),
         )
 
     def _handle_restart_expedition(self, stage: StageDefinition, timeout: float) -> None:
