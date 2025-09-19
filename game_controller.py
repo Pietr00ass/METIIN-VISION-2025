@@ -342,8 +342,10 @@ class GameController:
         self.toggle_skill(UserBind.BERSERK, reset_animation=reset_animation)
         self.toggle_skill(UserBind.AURA, reset_animation=reset_animation)
 
-    def start_attack(self):
-        if not self.attacking:
+    def start_attack(self, *, force: bool = False):
+        """Hold the basic attack key until :meth:`stop_attack` is called."""
+
+        if force or not self.attacking:
             self.press_key(GameBind.ATTACK)
             self.attacking = True
 

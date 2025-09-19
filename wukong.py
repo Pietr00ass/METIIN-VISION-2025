@@ -800,18 +800,23 @@ class WuKongAutomation:
         lure_key: UserBind = UserBind.MARMUREK,
         extra_callbacks: Optional[Sequence[Callable[[float], None]]] = None,
     ) -> Callable[[float], None]:
-        last_attack = 0.0
+        last_attack_check = 0.0
         next_skill_use: Dict[UserBind, float] = {}
         if skill_cooldowns:
             next_skill_use = {skill: 0.0 for skill in skill_cooldowns}
         next_lure = 0.0 if lure_interval is not None else None
 
         def _action(now: float) -> None:
-            nonlocal last_attack, next_lure
+            nonlocal last_attack_check, next_lure
 
-            if now - last_attack >= attack_interval:
-                self.game.tap_key(GameBind.ATTACK)
-                last_attack = now
+            if now - last_attack_check >= attack_interval:
+                # Keep the attack key pressed – relying on ``tap_key`` would
+                # release the key which stops the auto-attack.  ``force=True``
+                # mirrors the behaviour from ``dung_polana.py`` where the
+                # attack key press is reasserted periodically to recover from
+                # any stray release events.
+                self.game.start_attack(force=True)
+                last_attack_check = now
 
             for skill, cooldown in (skill_cooldowns or {}).items():
                 if now >= next_skill_use[skill]:
