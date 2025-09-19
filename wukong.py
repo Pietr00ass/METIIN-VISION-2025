@@ -82,13 +82,13 @@ DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.6
 DEFAULT_YOLO_DEVICE = "cuda:0"
 
 WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
-    ResourceName.WUKONG_MOB: ("moby",),
-    ResourceName.WUKONG_METIN: ("metin",),
-    ResourceName.WUKONG_CRIMSON_GOURD: ("karmazynowy_gurd",),
-    ResourceName.WUKONG_MONKEY_KING: ("wukong",),
-    ResourceName.WUKONG_CLOUD_GUARDIAN: ("obronca_chmur",),
-    ResourceName.WUKONG_PHOENIX_EGG: ("jaja_feniksa",),
-    ResourceName.WUKONG_FLAMING_PHOENIX: ("plomienny_feniks",),
+    ResourceName.WUKONG_MOB: ("wukong_mob", "moby"),
+    ResourceName.WUKONG_METIN: ("wukong_metin", "metin"),
+    ResourceName.WUKONG_CRIMSON_GOURD: ("wukong_crimson_gourd", "karmazynowy_gurd"),
+    ResourceName.WUKONG_MONKEY_KING: ("wukong_monkey_king", "wukong"),
+    ResourceName.WUKONG_CLOUD_GUARDIAN: ("wukong_cloud_guardian", "obronca_chmur"),
+    ResourceName.WUKONG_PHOENIX_EGG: ("wukong_phoenix_egg", "jajo", "jaja_feniksa"),
+    ResourceName.WUKONG_FLAMING_PHOENIX: ("wukong_flaming_phoenix", "plomienny_feniks"),
 }
 
 _OPTIONAL_YOLO_RESOURCES = {ResourceName.WUKONG_PHOENIX_EGG}
@@ -183,18 +183,66 @@ def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
         return {}
 
     mapping: Dict[ResourceName, int] = {}
-    available = ", ".join(sorted(normalized))
+    available_display = ", ".join(sorted(normalized))
+    alias_mismatches: list[Tuple[str, str]] = []
+    missing_resources: list[Tuple[ResourceName, Tuple[str, ...]]] = []
+
+    def _format_aliases(values: Sequence[str]) -> str:
+        seen = set()
+        ordered: list[str] = []
+        for candidate in values:
+            normalized_alias = candidate.lower()
+            if normalized_alias in seen:
+                continue
+            seen.add(normalized_alias)
+            ordered.append(candidate)
+        return ", ".join(ordered)
+
     for resource, aliases in WUKONG_YOLO_ALIASES.items():
+        canonical_alias = aliases[0]
+        matched_alias = None
         for alias in aliases:
             class_idx = normalized.get(alias.lower())
             if class_idx is not None:
                 mapping[resource] = class_idx
+                matched_alias = alias
                 break
-        else:
-            log_func = logger.debug if resource in _OPTIONAL_YOLO_RESOURCES else logger.warning
-            log_func(
-                f"Klasa YOLO dla zasobu '{resource.value}' nie została znaleziona w modelu. "
-                f"Dostępne klasy: {available}"
+
+        if matched_alias is None:
+            missing_resources.append((resource, aliases))
+            continue
+
+        if matched_alias.lower() != canonical_alias.lower():
+            alias_mismatches.append((canonical_alias, matched_alias))
+
+    if alias_mismatches:
+        formatted = ", ".join(
+            f"'{canonical}' dopasowano aliasem '{alias}'" for canonical, alias in alias_mismatches
+        )
+        logger.warning(
+            f"Mapowanie YOLO WuKonga wykorzystało aliasy: {formatted}. Dostępne klasy: {available_display}"
+        )
+
+    if missing_resources:
+        required = [item for item in missing_resources if item[0] not in _OPTIONAL_YOLO_RESOURCES]
+        optional = [item for item in missing_resources if item[0] in _OPTIONAL_YOLO_RESOURCES]
+
+        if required:
+            formatted_required = ", ".join(
+                f"'{aliases[0]}' (aliasy: {_format_aliases(aliases)})" for _, aliases in required
+            )
+            logger.warning(
+                f"Klasy YOLO dla zasobów {formatted_required} nie zostały znalezione w modelu. "
+                f"Dostępne klasy: {available_display}"
+            )
+
+        if optional:
+            formatted_optional = ", ".join(
+                f"'{aliases[0]}' (aliasy: {_format_aliases(aliases)})" for _, aliases in optional
+            )
+            logger.debug(
+                f"Opcjonalne zasoby WuKonga bez mapowania: {formatted_optional}. "
+                f"Dostępne klasy: {available_display}"
             )
 
     return mapping
