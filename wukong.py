@@ -1113,8 +1113,10 @@ class WuKongAutomation:
             self._wait_for_stage_prompt(stage, timeout)
 
         prompt_seen = prompt_already_confirmed
+        prompt_confirmed_via_keywords = prompt_already_confirmed
         last_progress: Optional[int] = None
         last_message = ""
+        current_prompt_message: Optional[str] = None
 
         while True:
             now = perf_counter()
@@ -1132,18 +1134,48 @@ class WuKongAutomation:
                     logger.debug("Komunikat lochów: %s", message)
                     last_message = message
 
-                if self._message_contains_keywords(message, stage.prompt_keywords):
+                matches_prompt_keywords = self._message_contains_keywords(
+                    message, stage.prompt_keywords
+                )
+
+                if matches_prompt_keywords:
+                    if not prompt_confirmed_via_keywords and not prompt_already_confirmed:
+                        logger.debug(
+                            "Potwierdzono komunikat etapu na podstawie słów kluczowych."
+                        )
                     prompt_seen = True
+                    prompt_confirmed_via_keywords = True
+                    if current_prompt_message != message:
+                        current_prompt_message = message
                     if progress_parser is not None:
                         remaining = progress_parser(message)
                         if remaining is not None and remaining != last_progress:
                             logger.info("Pozostało: %s", remaining)
                             last_progress = remaining
-                elif prompt_seen:
-                    if completion_keywords and self._message_contains_keywords(message, completion_keywords):
+                elif current_prompt_message is None:
+                    current_prompt_message = message
+                    prompt_seen = True
+                    if not prompt_confirmed_via_keywords:
+                        logger.debug(
+                            "Zapamiętano początkowy komunikat etapu bez dopasowania słów kluczowych: %s",
+                            message,
+                        )
+
+                if (
+                    prompt_seen
+                    and current_prompt_message is not None
+                    and message != current_prompt_message
+                ):
+                    if completion_keywords and self._message_contains_keywords(
+                        message, completion_keywords
+                    ):
                         logger.info("Wykryto komunikat kolejnego etapu: %s", message)
                     else:
                         logger.info("Komunikat etapu uległ zmianie: %s", message)
+                        if not prompt_confirmed_via_keywords:
+                            logger.debug(
+                                "Ukończono etap na podstawie zmiany komunikatu (ścieżka awaryjna)."
+                            )
                     elapsed = now - stage_start
                     logger.success("Etap '%s' ukończony w %.1fs.", stage.title, elapsed)
                     return elapsed
