@@ -745,6 +745,7 @@ class WuKongAutomation:
             "last_click": 0.0,
             "last_target": None,
             "unavailable_logged": False,
+            "attack_timestamp_updater": None,
         }
 
         def _callback(now: float) -> None:
@@ -797,9 +798,21 @@ class WuKongAutomation:
             if not should_click:
                 return
 
-            self.game.click_at(target)
+            self.game.stop_attack()
+            try:
+                self.game.click_at(target)
+            finally:
+                self.game.start_attack(force=True)
+                updater = state.get("attack_timestamp_updater")
+                if updater is not None:
+                    updater(now)
             state["last_target"] = target
             state["last_click"] = now
+
+        def _set_attack_timestamp_updater(updater: Callable[[float], None]) -> None:
+            state["attack_timestamp_updater"] = updater
+
+        _callback.set_attack_timestamp_updater = _set_attack_timestamp_updater  # type: ignore[attr-defined]
 
         return _callback
 
@@ -881,6 +894,16 @@ class WuKongAutomation:
         if skill_cooldowns:
             next_skill_use = {skill: 0.0 for skill in skill_cooldowns}
         next_lure = 0.0 if lure_interval is not None else None
+
+        def _update_attack_timestamp(timestamp: float) -> None:
+            nonlocal last_attack_check
+            last_attack_check = timestamp
+
+        if extra_callbacks:
+            for callback in extra_callbacks:
+                setter = getattr(callback, "set_attack_timestamp_updater", None)
+                if callable(setter):
+                    setter(_update_attack_timestamp)
 
         def _action(now: float) -> None:
             nonlocal last_attack_check, next_lure
