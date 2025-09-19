@@ -184,6 +184,7 @@ def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
 
     mapping: Dict[ResourceName, int] = {}
     available = ", ".join(sorted(normalized))
+
     for resource, aliases in WUKONG_YOLO_ALIASES.items():
         for alias in aliases:
             class_idx = normalized.get(alias.lower())
@@ -193,8 +194,10 @@ def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
         else:
             log_func = logger.debug if resource in _OPTIONAL_YOLO_RESOURCES else logger.warning
             log_func(
-                f"Klasa YOLO dla zasobu '{resource.value}' nie została znaleziona w modelu. "
-                f"Dostępne klasy: {available}"
+                "Klasa YOLO dla zasobu '%s' nie została znaleziona w modelu. "
+                "Dostępne klasy: %s",
+                resource.value,
+                available,
             )
 
     return mapping
