@@ -281,7 +281,7 @@ class WuKongAutomation:
 
         self._initialize_yolo_model()
 
-        self._stage_handlers: Dict[str, Callable[[StageDefinition, float], None]] = {
+        self._stage_handlers: Dict[str, Callable[[StageDefinition, float], float]] = {
             "slay_first_wave": self._handle_slay_first_wave,
             "destroy_first_metins": self._handle_destroy_first_metins,
             "clear_second_wave": self._handle_clear_second_wave,
@@ -298,6 +298,7 @@ class WuKongAutomation:
         }
 
         self._detection_log_state: Dict[ResourceName, Tuple[str, int]] = {}
+        self._last_stage_durations: list[Tuple[str, float]] = []
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -338,6 +339,8 @@ class WuKongAutomation:
         self._validate_start_stage(start_stage)
         start_time = perf_counter()
         aborted = False
+        self._last_stage_durations = []
+        stage_durations: list[Tuple[int, float]] = []
 
         if self._yolo_model is None:
             logger.warning(
@@ -351,11 +354,25 @@ class WuKongAutomation:
 
             handler = self._stage_handlers.get(stage.key, self._handle_generic_stage)
             try:
-                handler(stage, timeout)
+                duration = handler(stage, timeout)
             except StageTimeoutError as exc:
                 logger.error(str(exc))
                 aborted = True
                 break
+            else:
+                stage_durations.append((idx, duration))
+                self._last_stage_durations.append((stage.key, duration))
+
+        if stage_durations:
+            logger.info("Podsumowanie ukończonych etapów WuKonga:")
+            for idx, duration in stage_durations:
+                stage_info = STAGES[idx]
+                logger.info(
+                    " %2d. %-35s — %5.1fs",
+                    idx + 1,
+                    stage_info.title,
+                    duration,
+                )
 
         elapsed = perf_counter() - start_time
         if aborted:
@@ -1067,7 +1084,7 @@ class WuKongAutomation:
         progress_parser: Optional[Callable[[str], Optional[int]]] = None,
         completion_keywords: Optional[Sequence[str]] = None,
         prompt_already_confirmed: bool = False,
-    ) -> None:
+    ) -> float:
         stage_start = perf_counter()
         if not prompt_already_confirmed:
             self._wait_for_stage_prompt(stage, timeout)
@@ -1106,7 +1123,7 @@ class WuKongAutomation:
                         logger.info("Komunikat etapu uległ zmianie: %s", message)
                     elapsed = now - stage_start
                     logger.success("Etap '%s' ukończony w %.1fs.", stage.title, elapsed)
-                    return
+                    return elapsed
 
             sleep(0.5)
 
@@ -1186,12 +1203,12 @@ class WuKongAutomation:
             logger.debug(stage.hint)
         logger.info("=" * 72)
 
-    def _handle_generic_stage(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_generic_stage(self, stage: StageDefinition, timeout: float) -> float:
         logger.warning(
             "Brak dedykowanego handlera dla etapu '%s' – działanie ograniczone do monitoringu.",
             stage.title,
         )
-        self._monitor_stage(
+        return self._monitor_stage(
             stage,
             timeout,
             action_callback=None,
@@ -1210,7 +1227,7 @@ class WuKongAutomation:
         extra_callbacks: Optional[Sequence[Callable[[float], None]]] = None,
         progress_parser: Optional[Callable[[str], Optional[int]]] = None,
         prompt_confirmed: bool = False,
-    ) -> None:
+    ) -> float:
         self._prepare_for_combat()
         self.game.start_attack()
         action = self._make_basic_combat_action(
@@ -1221,7 +1238,7 @@ class WuKongAutomation:
         )
 
         try:
-            self._monitor_stage(
+            return self._monitor_stage(
                 stage,
                 timeout,
                 action_callback=action,
@@ -1286,12 +1303,12 @@ class WuKongAutomation:
     # Stage specific handlers
     # ------------------------------------------------------------------
 
-    def _handle_slay_first_wave(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_slay_first_wave(self, stage: StageDefinition, timeout: float) -> float:
         mob_engage = self._make_engage_callback(
             ResourceName.WUKONG_MOB,
             label="przeciwników WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
@@ -1300,7 +1317,7 @@ class WuKongAutomation:
             progress_parser=self._extract_remaining_count,
         )
 
-    def _handle_destroy_first_metins(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_destroy_first_metins(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_METIN,
             "kamieni Metin WuKonga",
@@ -1313,7 +1330,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.9,
@@ -1322,7 +1339,7 @@ class WuKongAutomation:
             progress_parser=self._extract_remaining_count,
         )
 
-    def _handle_clear_second_wave(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_clear_second_wave(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_MOB,
             "mobów drugiej fali WuKonga",
@@ -1335,7 +1352,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="mobów drugiej fali WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
@@ -1343,7 +1360,7 @@ class WuKongAutomation:
             extra_callbacks=(mob_tracker, mob_engage),
         )
 
-    def _handle_defeat_cloud_guardian(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_defeat_cloud_guardian(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_CLOUD_GUARDIAN,
             "Obrońcę Chmur WuKonga",
@@ -1356,7 +1373,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_CLOUD_GUARDIAN,
             label="Obrońcę Chmur WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.7,
@@ -1364,7 +1381,7 @@ class WuKongAutomation:
             extra_callbacks=(guardian_tracker, guardian_engage),
         )
 
-    def _handle_place_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_place_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> float:
         last_egg_usage = {"time": 0.0}
 
         def _egg_callback(now: float) -> None:
@@ -1377,7 +1394,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="przeciwników WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
@@ -1386,7 +1403,7 @@ class WuKongAutomation:
             progress_parser=self._extract_remaining_count,
         )
 
-    def _handle_destroy_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_destroy_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> float:
         egg_engage = self._make_engage_callback(
             ResourceName.WUKONG_PHOENIX_EGG,
             label="jaj Feniksa WuKonga",
@@ -1395,7 +1412,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="przeciwników WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.75,
@@ -1404,7 +1421,7 @@ class WuKongAutomation:
             progress_parser=self._extract_remaining_count,
         )
 
-    def _handle_repel_three_waves(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_repel_three_waves(self, stage: StageDefinition, timeout: float) -> float:
         logger.info("Aktywuję pelerynę (F4), aby przyspieszyć pojawianie się fal.")
         self.game.tap_key(UserBind.MARMUREK)
 
@@ -1420,7 +1437,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="przeciwników w falach WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.85,
@@ -1430,7 +1447,7 @@ class WuKongAutomation:
             extra_callbacks=(mob_tracker, mob_engage),
         )
 
-    def _handle_destroy_second_metin(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_destroy_second_metin(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_METIN,
             "ostatnich kamieni Metin WuKonga",
@@ -1443,7 +1460,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_METIN,
             label="kamieni Metin WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.9,
@@ -1452,7 +1469,7 @@ class WuKongAutomation:
             extra_callbacks=(metin_tracker, metin_engage),
         )
 
-    def _handle_defeat_flaming_phoenix(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_defeat_flaming_phoenix(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_FLAMING_PHOENIX,
             "Płomiennego Feniksa WuKonga",
@@ -1465,7 +1482,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_FLAMING_PHOENIX,
             label="Płomiennego Feniksa WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.7,
@@ -1473,7 +1490,7 @@ class WuKongAutomation:
             extra_callbacks=(phoenix_tracker, phoenix_engage),
         )
 
-    def _handle_clear_final_wave(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_clear_final_wave(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_MOB,
             "ostatnich przeciwników WuKonga",
@@ -1486,7 +1503,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MOB,
             label="ostatnich przeciwników WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.8,
@@ -1494,7 +1511,7 @@ class WuKongAutomation:
             extra_callbacks=(mob_tracker, mob_engage),
         )
 
-    def _handle_destroy_crimson_gourds(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_destroy_crimson_gourds(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_CRIMSON_GOURD,
             "Karmazynowych Gurd",
@@ -1507,7 +1524,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_CRIMSON_GOURD,
             label="Karmazynowych Gurd",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.85,
@@ -1516,7 +1533,7 @@ class WuKongAutomation:
             extra_callbacks=(gourd_tracker, gourd_engage),
         )
 
-    def _handle_defeat_wukong(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_defeat_wukong(self, stage: StageDefinition, timeout: float) -> float:
         self._confirm_template_presence(
             ResourceName.WUKONG_MONKEY_KING,
             "Małpiego Króla WuKonga",
@@ -1529,7 +1546,7 @@ class WuKongAutomation:
             ResourceName.WUKONG_MONKEY_KING,
             label="Małpiego Króla WuKonga",
         )
-        self._run_combat_stage(
+        return self._run_combat_stage(
             stage,
             timeout,
             attack_interval=0.65,
@@ -1537,13 +1554,13 @@ class WuKongAutomation:
             extra_callbacks=(boss_tracker, boss_engage),
         )
 
-    def _handle_restart_expedition(self, stage: StageDefinition, timeout: float) -> None:
+    def _handle_restart_expedition(self, stage: StageDefinition, timeout: float) -> float:
         self._wait_for_stage_prompt(stage, timeout)
         if self._execute_restart_sequence():
             logger.success("Próba restartu wyprawy zakończona powodzeniem.")
         else:
             logger.warning("Restart wyprawy wymaga ręcznej interwencji.")
-        self._monitor_stage(
+        return self._monitor_stage(
             stage,
             timeout,
             action_callback=None,
@@ -1551,6 +1568,12 @@ class WuKongAutomation:
             progress_parser=self._extract_remaining_count,
             prompt_already_confirmed=True,
         )
+
+    @property
+    def last_stage_durations(self) -> Tuple[Tuple[str, float], ...]:
+        """Return a snapshot of the durations recorded during the last run."""
+
+        return tuple(self._last_stage_durations)
 
 
 def run(
