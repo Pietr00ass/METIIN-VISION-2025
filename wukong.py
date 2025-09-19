@@ -1,11 +1,11 @@
-"""Automation scaffold for the WuKong expedition dungeon.
+"""High level automation script for the WuKong expedition dungeon.
 
-This module mirrors the command line ergonomics of :mod:`dung_polana` but
-provides a dedicated stage catalogue for the thirteen-step WuKong flow.  The
-actual combat/interaction logic is intentionally left as thin placeholders so
-that future development can focus on wiring new computer-vision assets and
-controller routines without rewriting the CLI plumbing again.
+This module reshapes the previous experiment-driven implementation into a
+single orchestration class inspired by ``dung_polana.py``.  The goal is to keep
+all of the knowledge gathered while building the initial WuKong prototype, but
+present it in a structure that mirrors the well-tested Valium Polana runner.
 """
+
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter, sleep
-from typing import Callable, Dict, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, NamedTuple, Optional, Sequence, Tuple
 
 import click
 import numpy as np
@@ -48,7 +48,14 @@ class WuKongAutomationConfig:
     restart_confirm_button: Optional[Tuple[int, int]] = None
 
 
+class StageTimeoutError(RuntimeError):
+    """Raised when a WuKong stage exceeds its allotted timeout."""
+
+
 CONFIG_PATH = Path("data/wukong_config.json")
+YOLO_MODEL_FILENAME = "wukong.pt"
+DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.6
+DEFAULT_YOLO_DEVICE = "cuda:0"
 
 DEFAULT_EGG_SLOT_CANDIDATES: Tuple[Tuple[int, int], ...] = (
     (648, 244),
@@ -62,7 +69,6 @@ DEFAULT_EGG_SLOT_CANDIDATES: Tuple[Tuple[int, int], ...] = (
     (742, 275),
     (776, 275),
 )
-
 DEFAULT_RESTART_BUTTON = (733, 65)
 DEFAULT_RESTART_CONFIRM_BUTTON = (359, 318)
 
@@ -72,14 +78,6 @@ DEFAULT_AUTOMATION_CONFIG = WuKongAutomationConfig(
     restart_confirm_button=DEFAULT_RESTART_CONFIRM_BUTTON,
 )
 
-
-class StageTimeoutError(RuntimeError):
-    """Raised when a WuKong stage exceeds its allotted timeout."""
-
-
-YOLO_MODEL_FILENAME = "wukong.pt"
-DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.6
-DEFAULT_YOLO_DEVICE = "cuda:0"
 
 WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
     ResourceName.WUKONG_MOB: ("wukong_mob", "moby"),
@@ -105,305 +103,29 @@ DETECTION_METHOD_TEMPLATE = "template"
 DETECTION_METHOD_UNAVAILABLE = "unavailable"
 
 
-_YOLO_MODEL: YOLO | None = None
-_YOLO_CLASS_IDS: Dict[ResourceName, int] = {}
-_YOLO_CONFIDENCE_THRESHOLD = DEFAULT_YOLO_CONFIDENCE_THRESHOLD
-_YOLO_VERBOSE = False
+REMAINING_PATTERN = re.compile(r"pozostał[oa]?\s*:?\s*(\d+)")
+PROMPT_WAIT_LIMIT = 15.0
 
+DEFAULT_STAGE_TIMEOUTS: Tuple[float, ...] = (
+    90,
+    180,
+    120,
+    150,
+    210,
+    150,
+    180,
+    150,
+    210,
+    150,
+    210,
+    240,
+    90,
+)
 
-def _load_wukong_config(path: Path = CONFIG_PATH) -> WuKongAutomationConfig:
-    """Load automation coordinates from JSON configuration if available."""
-
-    if not path.exists():
-        logger.warning(
-            "Nie znaleziono pliku %s – używam domyślnej konfiguracji WuKonga.",
-            path,
-        )
-        return DEFAULT_AUTOMATION_CONFIG
-
-    try:
-        raw_data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        logger.error("Nie można sparsować %s: %s", path, exc)
-        return DEFAULT_AUTOMATION_CONFIG
-
-    def _ensure_points(key: str) -> Tuple[Tuple[int, int], ...]:
-        value = raw_data.get(key)
-        if not value:
-            return getattr(DEFAULT_AUTOMATION_CONFIG, key)
-        try:
-            return tuple((int(x), int(y)) for x, y in value)
-        except (TypeError, ValueError):
-            logger.error(
-                "Nieprawidłowe współrzędne w polu '%s' w %s – korzystam z domyślnych.",
-                key,
-                path,
-            )
-            return getattr(DEFAULT_AUTOMATION_CONFIG, key)
-
-    egg_slots = _ensure_points("egg_slots")
-
-    def _ensure_point(key: str) -> Optional[Tuple[int, int]]:
-        value = raw_data.get(key)
-        if not value:
-            return getattr(DEFAULT_AUTOMATION_CONFIG, key)
-        try:
-            return int(value[0]), int(value[1])
-        except (TypeError, ValueError, IndexError):
-            logger.error(
-                "Nieprawidłowe współrzędne w polu '%s' w %s – korzystam z domyślnych.",
-                key,
-                path,
-            )
-            return getattr(DEFAULT_AUTOMATION_CONFIG, key)
-
-    restart_button = _ensure_point("restart_button")
-    restart_confirm_button = _ensure_point("restart_confirm_button")
-
-    return WuKongAutomationConfig(
-        egg_slots=egg_slots,
-        restart_button=restart_button,
-        restart_confirm_button=restart_confirm_button,
-    )
-
-
-def _resolve_yolo_class_map(model: YOLO) -> Dict[ResourceName, int]:
-    raw_names = {}
-    try:
-        raw_names = getattr(model, "names", {}) or {}
-    except AttributeError:
-        raw_names = {}
-
-    if not raw_names:
-        raw_names = getattr(getattr(model, "model", None), "names", {}) or {}
-
-    normalized = {str(name).lower(): int(idx) for idx, name in raw_names.items()}
-    if not normalized:
-        logger.warning("Model YOLO nie udostępnia nazw klas – mapowanie WuKonga będzie niedostępne.")
-        return {}
-
-    mapping: Dict[ResourceName, int] = {}
-    available_display = ", ".join(sorted(normalized))
-    alias_mismatches: list[Tuple[str, str]] = []
-    missing_resources: list[Tuple[ResourceName, Tuple[str, ...]]] = []
-
-    def _format_aliases(values: Sequence[str]) -> str:
-        seen = set()
-        ordered: list[str] = []
-        for candidate in values:
-            normalized_alias = candidate.lower()
-            if normalized_alias in seen:
-                continue
-            seen.add(normalized_alias)
-            ordered.append(candidate)
-        return ", ".join(ordered)
-
-    for resource, aliases in WUKONG_YOLO_ALIASES.items():
-        canonical_alias = aliases[0]
-        matched_alias = None
-        for alias in aliases:
-            class_idx = normalized.get(alias.lower())
-            if class_idx is not None:
-                mapping[resource] = class_idx
-                matched_alias = alias
-                break
-
-        if matched_alias is None:
-            missing_resources.append((resource, aliases))
-            continue
-
-        if matched_alias.lower() != canonical_alias.lower():
-            alias_mismatches.append((canonical_alias, matched_alias))
-
-    if alias_mismatches:
-        formatted = ", ".join(
-            f"'{canonical}' dopasowano aliasem '{alias}'" for canonical, alias in alias_mismatches
-        )
-        logger.warning(
-            f"Mapowanie YOLO WuKonga wykorzystało aliasy: {formatted}. Dostępne klasy: {available_display}"
-        )
-
-    if missing_resources:
-        required = [item for item in missing_resources if item[0] not in _OPTIONAL_YOLO_RESOURCES]
-        optional = [item for item in missing_resources if item[0] in _OPTIONAL_YOLO_RESOURCES]
-
-        if required:
-            formatted_required = ", ".join(
-                f"'{aliases[0]}' (aliasy: {_format_aliases(aliases)})" for _, aliases in required
-            )
-            logger.warning(
-                f"Klasy YOLO dla zasobów {formatted_required} nie zostały znalezione w modelu. "
-                f"Dostępne klasy: {available_display}"
-            )
-
-        if optional:
-            formatted_optional = ", ".join(
-                f"'{aliases[0]}' (aliasy: {_format_aliases(aliases)})" for _, aliases in optional
-            )
-            logger.debug(
-                f"Opcjonalne zasoby WuKonga bez mapowania: {formatted_optional}. "
-                f"Dostępne klasy: {available_display}"
-            )
-
-    return mapping
-
-
-def _initialize_yolo_model(device: str) -> None:
-    global _YOLO_MODEL, _YOLO_CLASS_IDS
-
-    if _YOLO_MODEL is not None:
-        return
-
-    try:
-        yolo_checks()
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.warning(f"Weryfikacja środowiska YOLO zakończona ostrzeżeniem: {exc}")
-
-    model_path = Path(MODELS_DIR) / YOLO_MODEL_FILENAME
-    if not model_path.exists():
-        logger.warning(
-            f"Model YOLO WuKonga nie został znaleziony pod ścieżką {model_path} – "
-            "powracam do detekcji szablonowej."
-        )
-        return
-
-    try:
-        model = YOLO(model_path)
-    except Exception as exc:  # pragma: no cover - runtime environment specific
-        logger.error("Nie udało się załadować modelu YOLO %s: %s", model_path, exc)
-        return
-
-    try:
-        model.to(device)
-    except Exception as exc:  # pragma: no cover - CUDA availability varies
-        logger.warning(
-            f"Nie można załadować modelu na urządzenie {device} ({exc}). Używam CPU."
-        )
-        model.to("cpu")
-
-    _YOLO_MODEL = model
-    _YOLO_CLASS_IDS = _resolve_yolo_class_map(model)
-
-    if _YOLO_CLASS_IDS:
-        logger.info(
-            f"Załadowano model YOLO WuKonga – zmapowano {len(_YOLO_CLASS_IDS)} klas."
-        )
-    else:
-        logger.warning("Model YOLO WuKonga załadowany, lecz nie znaleziono żadnych zgodnych klas.")
-
-
-def _get_yolo_class_id(resource: ResourceName) -> Optional[int]:
-    return _YOLO_CLASS_IDS.get(resource)
-
-
-def _predict_yolo(frame: np.ndarray, *, conf: Optional[float] = None):
-    if _YOLO_MODEL is None:
-        return None
-
-    inference_conf = _YOLO_CONFIDENCE_THRESHOLD if conf is None else max(float(conf), _YOLO_CONFIDENCE_THRESHOLD)
-
-    try:
-        results_list = _YOLO_MODEL.predict(
-            source=VisionDetector.fill_non_clickable_wth_black(frame.copy()),
-            conf=inference_conf,
-            verbose=_YOLO_VERBOSE,
-        )
-    except Exception as exc:  # pragma: no cover - runtime specific
-        logger.error("Błąd podczas inferencji modelu YOLO WuKonga: %s", exc)
-        return None
-
-    if not results_list:
-        return None
-
-    return results_list[0]
-
-
-def _detect_with_yolo(
-    vision: VisionDetector,
-    frame: np.ndarray,
-    resource: ResourceName,
-    *,
-    threshold: Optional[float] = None,
-) -> Tuple[Tuple[int, int], ...]:
-    class_id = _get_yolo_class_id(resource)
-    if class_id is None:
-        return tuple()
-
-    result = _predict_yolo(frame, conf=threshold)
-    if result is None or result.boxes is None or result.boxes.cls is None:
-        return tuple()
-
-    classes = result.boxes.cls.cpu().numpy().astype(int)
-    confidences = (
-        result.boxes.conf.cpu().numpy()
-        if getattr(result.boxes, "conf", None) is not None
-        else np.ones_like(classes, dtype=float)
-    )
-    mask = classes == class_id
-
-    if threshold is not None:
-        mask &= confidences >= float(threshold)
-
-    if not np.any(mask):
-        return tuple()
-
-    xywh = result.boxes.xywh.cpu().numpy()
-    centers = xywh[mask, :2]
-    return tuple(
-        vision.get_global_pos((int(round(x)), int(round(y))))
-        for x, y in centers
-    )
-
-
-def _detect_resource_positions(
-    vision: VisionDetector,
-    resource: ResourceName,
-    *,
-    frame: Optional[np.ndarray] = None,
-    threshold: Optional[float] = None,
-) -> DetectionResult:
-    fallback_threshold = threshold if threshold is not None else 0.85
-
-    if frame is None:
-        frame = vision.capture_frame()
-    if frame is None:
-        return DetectionResult(tuple(), DETECTION_METHOD_FRAME_MISSING)
-
-    if _YOLO_MODEL is not None and _get_yolo_class_id(resource) is not None:
-        detections = _detect_with_yolo(vision, frame, resource, threshold=threshold)
-        if detections:
-            return DetectionResult(detections, DETECTION_METHOD_YOLO)
-        if resource.value in vision.target_templates:
-            template_detections = vision.locate_all_templates(
-                resource,
-                frame=frame,
-                threshold=fallback_threshold,
-            )
-            if template_detections:
-                logger.debug(
-                    "Model YOLO nie wykrył '%s' – korzystam z klasycznego wzorca jako wsparcia.",
-                    resource.value,
-                )
-                return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
-        return DetectionResult(tuple(), DETECTION_METHOD_YOLO)
-
-    if resource.value in vision.target_templates:
-        template_detections = vision.locate_all_templates(
-            resource,
-            frame=frame,
-            threshold=fallback_threshold,
-        )
-        return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
-
-    return DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
-
-
-def _detection_method_verbose_label(method: str) -> str:
-    if method == DETECTION_METHOD_YOLO:
-        return "modelem YOLO"
-    if method == DETECTION_METHOD_TEMPLATE:
-        return "szablonem"
-    return "niezidentyfikowanym detektorem"
+DEFAULT_SKILL_COOLDOWNS: Dict[UserBind, float] = {
+    UserBind.WIREK: 9.0,
+    UserBind.SZARZA: 12.0,
+}
 
 
 STAGES: Tuple[StageDefinition, ...] = (
@@ -513,944 +235,1118 @@ STAGES: Tuple[StageDefinition, ...] = (
     ),
 )
 
-DEFAULT_STAGE_TIMEOUTS: Tuple[float, ...] = (
-    90,
-    180,
-    120,
-    150,
-    210,
-    150,
-    180,
-    150,
-    210,
-    150,
-    210,
-    240,
-    90,
-)
 
-StageHandler = Callable[[GameController, VisionDetector, StageDefinition, float], None]
+class WuKongAutomation:
+    """Class orchestrating the WuKong expedition flow."""
 
+    def __init__(
+        self,
+        *,
+        log_level: str,
+        saved_credentials_idx: int,
+        stage_timeouts: Sequence[float] | str,
+        yolo_confidence_threshold: float,
+        yolo_device: str,
+    ) -> None:
+        self.log_level = log_level.upper()
+        self.saved_credentials_idx = saved_credentials_idx
+        self.stage_timeouts = self._parse_stage_timeouts(stage_timeouts)
+        self._yolo_confidence_threshold = max(float(yolo_confidence_threshold), 0.0)
+        self._yolo_device = yolo_device
+        self._yolo_verbose = self.log_level in {"TRACE", "DEBUG"}
 
-AUTOMATION_CONFIG = DEFAULT_AUTOMATION_CONFIG
-_BUFFS_INITIALIZED = False
-_REMAINING_PATTERN = re.compile(r"pozostał[oa]?\s*:?\s*(\d+)")
-_PROMPT_WAIT_LIMIT = 15.0
+        self.config = self._load_wukong_config()
+        logger.debug("Załadowana konfiguracja WuKonga: %s", self.config)
 
-DEFAULT_SKILL_COOLDOWNS: Dict[UserBind, float] = {
-    UserBind.WIREK: 9.0,
-    UserBind.SZARZA: 12.0,
-}
-
-
-def _normalize_text(text: str) -> str:
-    return text.strip().lower()
-
-
-def _message_contains_keywords(message: str, keywords: Sequence[str]) -> bool:
-    if not keywords:
-        return False
-    normalized = _normalize_text(message)
-    return all(keyword in normalized for keyword in keywords)
-
-
-def _extract_remaining_count(message: str) -> Optional[int]:
-    match = _REMAINING_PATTERN.search(_normalize_text(message))
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:  # pragma: no cover - defensive
-        return None
-
-
-def _capture_dungeon_message(vision: VisionDetector) -> str:
-    frame = vision.capture_frame()
-    if frame is None:
-        logger.warning("Brak klatki z gry – ponawiam próbę po krótkiej pauzie.")
-        sleep(1.0)
-        return ""
-    return vision.get_dungeon_message(frame)
-
-
-def _wait_for_stage_prompt(vision: VisionDetector, stage: StageDefinition, timeout: float) -> None:
-    if not stage.prompt_keywords:
-        return
-
-    deadline = perf_counter() + min(timeout, _PROMPT_WAIT_LIMIT)
-    while perf_counter() < deadline:
-        message = _capture_dungeon_message(vision)
-        if message and _message_contains_keywords(message, stage.prompt_keywords):
-            logger.info("Wykryto komunikat etapu: %s", message)
-            return
-        sleep(0.5)
-
-    logger.warning(
-        "Nie udało się potwierdzić komunikatu etapu '%s' w ciągu %.1fs.",
-        stage.title,
-        min(timeout, _PROMPT_WAIT_LIMIT),
-    )
-
-
-def _prepare_for_combat(game: GameController) -> None:
-    global _BUFFS_INITIALIZED
-    if _BUFFS_INITIALIZED:
-        return
-
-    logger.debug("Aktywuję premie bojowe przed pierwszym starciem.")
-    game.use_boosters()
-    game.toggle_passive_skills(reset_animation=False)
-    _BUFFS_INITIALIZED = True
-
-
-def _make_basic_combat_action(
-    game: GameController,
-    *,
-    attack_interval: float = 1.0,
-    skill_cooldowns: Optional[Dict[UserBind, float]] = None,
-    lure_interval: Optional[float] = None,
-    lure_key: UserBind = UserBind.MARMUREK,
-    extra_callbacks: Optional[Sequence[Callable[[float], None]]] = None,
-) -> Callable[[float], None]:
-    last_attack = 0.0
-    next_skill_use: Dict[UserBind, float] = {}
-    if skill_cooldowns:
-        next_skill_use = {skill: 0.0 for skill in skill_cooldowns}
-    next_lure = 0.0 if lure_interval is not None else None
-
-    def _action(now: float) -> None:
-        nonlocal last_attack, next_lure
-
-        if now - last_attack >= attack_interval:
-            game.tap_key(GameBind.ATTACK)
-            last_attack = now
-
-        for skill, cooldown in (skill_cooldowns or {}).items():
-            if now >= next_skill_use[skill]:
-                game.tap_key(skill)
-                next_skill_use[skill] = now + cooldown
-
-        if lure_interval is not None and next_lure is not None and now >= next_lure:
-            game.tap_key(lure_key)
-            next_lure = now + lure_interval
-
-        if extra_callbacks:
-            for callback in extra_callbacks:
-                callback(now)
-
-    return _action
-
-
-def _confirm_template_presence(
-    vision: VisionDetector,
-    resource: ResourceName,
-    label: str,
-    *,
-    threshold: float = 0.82,
-) -> None:
-    detection = _detect_resource_positions(
-        vision,
-        resource,
-        threshold=threshold,
-    )
-    method = detection.method
-
-    if method == DETECTION_METHOD_FRAME_MISSING:
-        logger.warning("Nie udało się pobrać klatki do potwierdzenia %s.", label)
-        return
-
-    if method == DETECTION_METHOD_UNAVAILABLE:
-        logger.debug(
-            "Pominięto wstępne potwierdzenie %s – brak detektora dla '%s'.",
-            label,
-            resource.value,
+        self.vision = VisionDetector()
+        self.game = GameController(
+            vision_detector=self.vision,
+            start_delay=2,
+            saved_credentials_idx=self.saved_credentials_idx,
         )
-        return
 
-    if detection.positions:
-        logger.info(
-            "Potwierdzono obecność %s (%s; detekcje: %d).",
-            label,
-            _detection_method_verbose_label(method),
-            len(detection.positions),
-        )
-    else:
-        if method == DETECTION_METHOD_YOLO:
-            logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+        self._buffs_initialized = False
+        self._yolo_model: YOLO | None = None
+        self._yolo_class_ids: Dict[ResourceName, int] = {}
+
+        self._initialize_yolo_model()
+
+        self._stage_handlers: Dict[str, Callable[[StageDefinition, float], None]] = {
+            "slay_first_wave": self._handle_slay_first_wave,
+            "destroy_first_metins": self._handle_destroy_first_metins,
+            "clear_second_wave": self._handle_clear_second_wave,
+            "defeat_cloud_guardian": self._handle_defeat_cloud_guardian,
+            "place_phoenix_eggs": self._handle_place_phoenix_eggs,
+            "destroy_phoenix_eggs": self._handle_destroy_phoenix_eggs,
+            "repel_three_waves": self._handle_repel_three_waves,
+            "destroy_second_metin": self._handle_destroy_second_metin,
+            "defeat_flaming_phoenix": self._handle_defeat_flaming_phoenix,
+            "clear_final_wave": self._handle_clear_final_wave,
+            "destroy_crimson_gourds": self._handle_destroy_crimson_gourds,
+            "defeat_wukong": self._handle_defeat_wukong,
+            "restart_expedition": self._handle_restart_expedition,
+        }
+
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_stage_timeouts(stage_timeouts: Sequence[float] | str) -> Tuple[float, ...]:
+        if isinstance(stage_timeouts, str):
+            raw = stage_timeouts.replace(";", ",").replace("\n", ",")
+            items = [item.strip() for item in raw.split(",") if item.strip()]
         else:
-            logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
+            items = [str(item) for item in stage_timeouts]
 
-
-def _make_template_presence_callback(
-    vision: VisionDetector,
-    resource: ResourceName,
-    *,
-    label: str,
-    threshold: float = 0.82,
-    interval: float = 4.0,
-) -> Callable[[float], None]:
-    state = {"last_check": 0.0, "present": None, "missing_logged": False}
-
-    def _callback(now: float) -> None:
-        if now - state["last_check"] < interval:
-            return
-
-        detection = _detect_resource_positions(
-            vision,
-            resource,
-            threshold=threshold,
-        )
-        method = detection.method
-
-        if method == DETECTION_METHOD_UNAVAILABLE:
-            if not state["missing_logged"]:
-                logger.debug(
-                    "Pomijam monitorowanie %s – brak detektora dla '%s'.",
-                    label,
-                    resource.value,
-                )
-                state["missing_logged"] = True
-            state["last_check"] = now
-            return
-
-        if method == DETECTION_METHOD_FRAME_MISSING:
-            logger.warning("Nie udało się pobrać klatki do monitorowania %s.", label)
-            state["last_check"] = now
-            return
-
-        present = bool(detection.positions)
-        method_verbose = _detection_method_verbose_label(method)
-
-        if state["present"] is None:
-            if present:
-                logger.info("Wykryto %s (%s).", label, method_verbose)
-            else:
-                if method == DETECTION_METHOD_YOLO:
-                    logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
-                else:
-                    logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
-        elif present != state["present"]:
-            if present:
-                logger.info("%s ponownie widoczne (%s).", label.capitalize(), method_verbose)
-            else:
-                logger.success("%s nie są już wykrywane (%s).", label.capitalize(), method_verbose)
-
-        state["present"] = present
-        state["last_check"] = now
-
-    return _callback
-
-
-def _make_template_count_callback(
-    vision: VisionDetector,
-    resource: ResourceName,
-    *,
-    label: str,
-    threshold: float = 0.82,
-    interval: float = 4.0,
-) -> Callable[[float], None]:
-    state = {"last_check": 0.0, "count": None, "missing_logged": False}
-
-    def _callback(now: float) -> None:
-        if now - state["last_check"] < interval:
-            return
-
-        detection = _detect_resource_positions(
-            vision,
-            resource,
-            threshold=threshold,
-        )
-        method = detection.method
-
-        if method == DETECTION_METHOD_UNAVAILABLE:
-            if not state["missing_logged"]:
-                logger.debug(
-                    "Pomijam monitorowanie liczby %s – brak detektora dla '%s'.",
-                    label,
-                    resource.value,
-                )
-                state["missing_logged"] = True
-            state["last_check"] = now
-            return
-
-        if method == DETECTION_METHOD_FRAME_MISSING:
-            logger.warning("Nie udało się pobrać klatki do monitorowania liczby %s.", label)
-            state["last_check"] = now
-            return
-
-        count = len(detection.positions)
-        method_verbose = _detection_method_verbose_label(method)
-
-        if state["count"] is None:
-            if count:
-                logger.info("Wykryto %d %s (%s).", count, label, method_verbose)
-            else:
-                if method == DETECTION_METHOD_YOLO:
-                    logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
-                else:
-                    logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
-        elif count != state["count"]:
-            if count < state["count"]:
-                logger.success(
-                    "Pozostało %d %s (poprzednio %d; %s).",
-                    count,
-                    label,
-                    state["count"],
-                    method_verbose,
-                )
-            else:
-                logger.warning(
-                    "Liczba %s wzrosła z %d do %d (%s).",
-                    label,
-                    state["count"],
-                    count,
-                    method_verbose,
-                )
-
-        state["count"] = count
-        state["last_check"] = now
-
-    return _callback
-
-
-def _monitor_stage(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-    *,
-    action_callback: Optional[Callable[[float], None]] = None,
-    progress_parser: Optional[Callable[[str], Optional[int]]] = None,
-    completion_keywords: Optional[Sequence[str]] = None,
-    prompt_already_confirmed: bool = False,
-) -> None:
-    stage_start = perf_counter()
-    if not prompt_already_confirmed:
-        _wait_for_stage_prompt(vision, stage, timeout)
-
-    prompt_seen = prompt_already_confirmed
-    last_progress: Optional[int] = None
-    last_message = ""
-
-    while True:
-        now = perf_counter()
-        if now - stage_start > timeout:
-            raise StageTimeoutError(
-                f"Etap '{stage.title}' przekroczył limit {timeout:.0f}s."
+        expected = len(STAGES)
+        if len(items) != expected:
+            raise ValueError(
+                "stage_timeouts must contain exactly "
+                f"{expected} wartości rozdzielonych przecinkiem (po jednej na każdy etap)."
             )
 
-        if action_callback is not None:
-            action_callback(now)
+        try:
+            parsed = tuple(float(item) for item in items)
+        except ValueError as exc:
+            raise ValueError(
+                "Nie udało się sparsować stage_timeouts – upewnij się, że podajesz tylko liczby."
+            ) from exc
 
-        message = _capture_dungeon_message(vision)
-        if message:
-            if message != last_message:
-                logger.debug("Komunikat lochów: %s", message)
-                last_message = message
+        return parsed
 
-            if _message_contains_keywords(message, stage.prompt_keywords):
-                prompt_seen = True
-                if progress_parser is not None:
-                    remaining = progress_parser(message)
-                    if remaining is not None and remaining != last_progress:
-                        logger.info("Pozostało: %s", remaining)
-                        last_progress = remaining
-            elif prompt_seen:
-                if completion_keywords and _message_contains_keywords(message, completion_keywords):
-                    logger.info("Wykryto komunikat kolejnego etapu: %s", message)
-                else:
-                    logger.info("Komunikat etapu uległ zmianie: %s", message)
-                elapsed = now - stage_start
-                logger.success("Etap '%s' ukończony w %.1fs.", stage.title, elapsed)
+    @staticmethod
+    def _validate_start_stage(start_stage: int) -> None:
+        if start_stage < 0 or start_stage >= len(STAGES):
+            raise ValueError(
+                f"Stage index {start_stage} spoza zakresu 0-{len(STAGES) - 1}."
+            )
+
+    def run(self, start_stage: int) -> None:
+        self._validate_start_stage(start_stage)
+        start_time = perf_counter()
+        aborted = False
+
+        if self._yolo_model is None:
+            logger.warning(
+                "Model YOLO WuKonga nie został załadowany – wykorzystywane będą jedynie dostępne szablony."
+            )
+
+        for idx in range(start_stage, len(STAGES)):
+            stage = STAGES[idx]
+            timeout = self.stage_timeouts[idx]
+            self._log_stage_banner(idx, stage, timeout)
+
+            handler = self._stage_handlers.get(stage.key, self._handle_generic_stage)
+            try:
+                handler(stage, timeout)
+            except StageTimeoutError as exc:
+                logger.error(str(exc))
+                aborted = True
+                break
+
+        elapsed = perf_counter() - start_time
+        if aborted:
+            logger.error("WuKong expedition przerwana po %.2fs z powodu przekroczonego limitu.", elapsed)
+        else:
+            logger.success("WuKong expedition flow finished in %.2fs", elapsed)
+
+        self.game.reset_game_state()
+
+    # ------------------------------------------------------------------
+    # Configuration & model loading
+    # ------------------------------------------------------------------
+
+    def _load_wukong_config(self, path: Path = CONFIG_PATH) -> WuKongAutomationConfig:
+        if not path.exists():
+            logger.warning(
+                "Nie znaleziono pliku %s – używam domyślnej konfiguracji WuKonga.",
+                path,
+            )
+            return DEFAULT_AUTOMATION_CONFIG
+
+        try:
+            raw_data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            logger.error("Nie można sparsować %s: %s", path, exc)
+            return DEFAULT_AUTOMATION_CONFIG
+
+        def _ensure_points(key: str) -> Tuple[Tuple[int, int], ...]:
+            value = raw_data.get(key)
+            if not value:
+                return getattr(DEFAULT_AUTOMATION_CONFIG, key)
+            try:
+                return tuple((int(x), int(y)) for x, y in value)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Nieprawidłowe współrzędne w polu '%s' w %s – korzystam z domyślnych.",
+                    key,
+                    path,
+                )
+                return getattr(DEFAULT_AUTOMATION_CONFIG, key)
+
+        def _ensure_point(key: str) -> Optional[Tuple[int, int]]:
+            value = raw_data.get(key)
+            if not value:
+                return getattr(DEFAULT_AUTOMATION_CONFIG, key)
+            try:
+                return int(value[0]), int(value[1])
+            except (TypeError, ValueError, IndexError):
+                logger.error(
+                    "Nieprawidłowe współrzędne w polu '%s' w %s – korzystam z domyślnych.",
+                    key,
+                    path,
+                )
+                return getattr(DEFAULT_AUTOMATION_CONFIG, key)
+
+        return WuKongAutomationConfig(
+            egg_slots=_ensure_points("egg_slots"),
+            restart_button=_ensure_point("restart_button"),
+            restart_confirm_button=_ensure_point("restart_confirm_button"),
+        )
+
+    def _initialize_yolo_model(self) -> None:
+        try:
+            yolo_checks()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning(f"Weryfikacja środowiska YOLO zakończona ostrzeżeniem: {exc}")
+
+        model_path = Path(MODELS_DIR) / YOLO_MODEL_FILENAME
+        if not model_path.exists():
+            logger.warning(
+                f"Model YOLO WuKonga nie został znaleziony pod ścieżką {model_path} – "
+                "powracam do detekcji szablonowej."
+            )
+            return
+
+        try:
+            model = YOLO(model_path)
+        except Exception as exc:  # pragma: no cover - runtime environment specific
+            logger.error("Nie udało się załadować modelu YOLO %s: %s", model_path, exc)
+            return
+
+        try:
+            model.to(self._yolo_device)
+        except Exception as exc:  # pragma: no cover - CUDA availability varies
+            logger.warning(
+                f"Nie można załadować modelu na urządzenie {self._yolo_device} ({exc}). Używam CPU."
+            )
+            model.to("cpu")
+
+        self._yolo_model = model
+        self._yolo_class_ids = self._resolve_yolo_class_map(model)
+
+        if self._yolo_class_ids:
+            logger.info(
+                f"Załadowano model YOLO WuKonga – zmapowano {len(self._yolo_class_ids)} klas."
+            )
+        else:
+            logger.warning("Model YOLO WuKonga załadowany, lecz nie znaleziono żadnych zgodnych klas.")
+
+    def _resolve_yolo_class_map(self, model: YOLO) -> Dict[ResourceName, int]:
+        raw_names: Dict[int, str] = {}
+        try:
+            raw_names = getattr(model, "names", {}) or {}
+        except AttributeError:
+            raw_names = {}
+
+        if not raw_names:
+            raw_names = getattr(getattr(model, "model", None), "names", {}) or {}
+
+        normalized = {str(name).lower(): int(idx) for idx, name in raw_names.items()}
+        if not normalized:
+            logger.warning("Model YOLO nie udostępnia nazw klas – mapowanie WuKonga będzie niedostępne.")
+            return {}
+
+        mapping: Dict[ResourceName, int] = {}
+        available_display = ", ".join(sorted(normalized))
+        alias_mismatches: list[Tuple[str, str]] = []
+        missing_resources: list[Tuple[ResourceName, Tuple[str, ...]]] = []
+
+        def _format_aliases(values: Iterable[str]) -> str:
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for candidate in values:
+                normalized_alias = candidate.lower()
+                if normalized_alias in seen:
+                    continue
+                seen.add(normalized_alias)
+                ordered.append(candidate)
+            return ", ".join(ordered)
+
+        for resource, aliases in WUKONG_YOLO_ALIASES.items():
+            canonical_alias = aliases[0]
+            matched_alias = None
+            for alias in aliases:
+                class_idx = normalized.get(alias.lower())
+                if class_idx is not None:
+                    mapping[resource] = class_idx
+                    matched_alias = alias
+                    break
+
+            if matched_alias is None:
+                missing_resources.append((resource, aliases))
+                continue
+
+            if matched_alias.lower() != canonical_alias.lower():
+                alias_mismatches.append((canonical_alias, matched_alias))
+
+        if alias_mismatches:
+            formatted = ", ".join(
+                f"'{canonical}' dopasowano aliasem '{alias}'" for canonical, alias in alias_mismatches
+            )
+            logger.warning(
+                f"Mapowanie YOLO WuKonga wykorzystało aliasy: {formatted}. Dostępne klasy: {available_display}"
+            )
+
+        if missing_resources:
+            required = [item for item in missing_resources if item[0] not in _OPTIONAL_YOLO_RESOURCES]
+            optional = [item for item in missing_resources if item[0] in _OPTIONAL_YOLO_RESOURCES]
+
+            if required:
+                formatted_required = ", ".join(
+                    f"'{aliases[0]}' (aliasy: {_format_aliases(aliases)})" for _, aliases in required
+                )
+                logger.warning(
+                    f"Klasy YOLO dla zasobów {formatted_required} nie zostały znalezione w modelu. "
+                    f"Dostępne klasy: {available_display}"
+                )
+
+            if optional:
+                formatted_optional = ", ".join(
+                    f"'{aliases[0]}' (aliasy: {_format_aliases(aliases)})" for _, aliases in optional
+                )
+                logger.debug(
+                    f"Opcjonalne zasoby WuKonga bez mapowania: {formatted_optional}. "
+                    f"Dostępne klasy: {available_display}"
+                )
+
+        return mapping
+
+    # ------------------------------------------------------------------
+    # Detection utilities
+    # ------------------------------------------------------------------
+
+    def _get_yolo_class_id(self, resource: ResourceName) -> Optional[int]:
+        return self._yolo_class_ids.get(resource)
+
+    def _predict_yolo(self, frame: np.ndarray, *, conf: Optional[float] = None):
+        if self._yolo_model is None:
+            return None
+
+        inference_conf = (
+            self._yolo_confidence_threshold
+            if conf is None
+            else max(float(conf), self._yolo_confidence_threshold)
+        )
+
+        try:
+            results_list = self._yolo_model.predict(
+                source=VisionDetector.fill_non_clickable_wth_black(frame.copy()),
+                conf=inference_conf,
+                verbose=self._yolo_verbose,
+            )
+        except Exception as exc:  # pragma: no cover - runtime specific
+            logger.error("Błąd podczas inferencji modelu YOLO WuKonga: %s", exc)
+            return None
+
+        if not results_list:
+            return None
+
+        return results_list[0]
+
+    def _detect_with_yolo(
+        self,
+        frame: np.ndarray,
+        resource: ResourceName,
+        *,
+        threshold: Optional[float] = None,
+    ) -> Tuple[Tuple[int, int], ...]:
+        class_id = self._get_yolo_class_id(resource)
+        if class_id is None:
+            return tuple()
+
+        result = self._predict_yolo(frame, conf=threshold)
+        if result is None or result.boxes is None or result.boxes.cls is None:
+            return tuple()
+
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+        confidences = (
+            result.boxes.conf.cpu().numpy()
+            if getattr(result.boxes, "conf", None) is not None
+            else np.ones_like(classes, dtype=float)
+        )
+        mask = classes == class_id
+
+        if threshold is not None:
+            mask &= confidences >= float(threshold)
+
+        if not np.any(mask):
+            return tuple()
+
+        xywh = result.boxes.xywh.cpu().numpy()
+        centers = xywh[mask, :2]
+        return tuple(
+            self.vision.get_global_pos((int(round(x)), int(round(y))))
+            for x, y in centers
+        )
+
+    def _detect_resource_positions(
+        self,
+        resource: ResourceName,
+        *,
+        frame: Optional[np.ndarray] = None,
+        threshold: Optional[float] = None,
+    ) -> DetectionResult:
+        fallback_threshold = threshold if threshold is not None else 0.85
+
+        if frame is None:
+            frame = self.vision.capture_frame()
+        if frame is None:
+            return DetectionResult(tuple(), DETECTION_METHOD_FRAME_MISSING)
+
+        if self._yolo_model is not None and self._get_yolo_class_id(resource) is not None:
+            detections = self._detect_with_yolo(frame, resource, threshold=threshold)
+            if detections:
+                return DetectionResult(detections, DETECTION_METHOD_YOLO)
+            if resource.value in self.vision.target_templates:
+                template_detections = self.vision.locate_all_templates(
+                    resource,
+                    frame=frame,
+                    threshold=fallback_threshold,
+                )
+                if template_detections:
+                    logger.debug(
+                        "Model YOLO nie wykrył '%s' – korzystam z klasycznego wzorca jako wsparcia.",
+                        resource.value,
+                    )
+                    return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+            return DetectionResult(tuple(), DETECTION_METHOD_YOLO)
+
+        if resource.value in self.vision.target_templates:
+            template_detections = self.vision.locate_all_templates(
+                resource,
+                frame=frame,
+                threshold=fallback_threshold,
+            )
+            return DetectionResult(template_detections, DETECTION_METHOD_TEMPLATE)
+
+        return DetectionResult(tuple(), DETECTION_METHOD_UNAVAILABLE)
+
+    @staticmethod
+    def _detection_method_verbose_label(method: str) -> str:
+        if method == DETECTION_METHOD_YOLO:
+            return "modelem YOLO"
+        if method == DETECTION_METHOD_TEMPLATE:
+            return "szablonem"
+        return "niezidentyfikowanym detektorem"
+
+    # ------------------------------------------------------------------
+    # Text helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return text.strip().lower()
+
+    @staticmethod
+    def _message_contains_keywords(message: str, keywords: Sequence[str]) -> bool:
+        if not keywords:
+            return False
+        normalized = WuKongAutomation._normalize_text(message)
+        return all(keyword in normalized for keyword in keywords)
+
+    @staticmethod
+    def _extract_remaining_count(message: str) -> Optional[int]:
+        match = REMAINING_PATTERN.search(WuKongAutomation._normalize_text(message))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:  # pragma: no cover - defensive
+            return None
+
+    # ------------------------------------------------------------------
+    # Stage monitoring primitives
+    # ------------------------------------------------------------------
+
+    def _capture_dungeon_message(self) -> str:
+        frame = self.vision.capture_frame()
+        if frame is None:
+            logger.warning("Brak klatki z gry – ponawiam próbę po krótkiej pauzie.")
+            sleep(1.0)
+            return ""
+        return self.vision.get_dungeon_message(frame)
+
+    def _wait_for_stage_prompt(self, stage: StageDefinition, timeout: float) -> None:
+        if not stage.prompt_keywords:
+            return
+
+        deadline = perf_counter() + min(timeout, PROMPT_WAIT_LIMIT)
+        while perf_counter() < deadline:
+            message = self._capture_dungeon_message()
+            if message and self._message_contains_keywords(message, stage.prompt_keywords):
+                logger.info("Wykryto komunikat etapu: %s", message)
+                return
+            sleep(0.5)
+
+        logger.warning(
+            "Nie udało się potwierdzić komunikatu etapu '%s' w ciągu %.1fs.",
+            stage.title,
+            min(timeout, PROMPT_WAIT_LIMIT),
+        )
+
+    def _prepare_for_combat(self) -> None:
+        if self._buffs_initialized:
+            return
+
+        logger.debug("Aktywuję premie bojowe przed pierwszym starciem.")
+        self.game.use_boosters()
+        self.game.toggle_passive_skills(reset_animation=False)
+        self._buffs_initialized = True
+
+    def _make_basic_combat_action(
+        self,
+        *,
+        attack_interval: float = 1.0,
+        skill_cooldowns: Optional[Dict[UserBind, float]] = None,
+        lure_interval: Optional[float] = None,
+        lure_key: UserBind = UserBind.MARMUREK,
+        extra_callbacks: Optional[Sequence[Callable[[float], None]]] = None,
+    ) -> Callable[[float], None]:
+        last_attack = 0.0
+        next_skill_use: Dict[UserBind, float] = {}
+        if skill_cooldowns:
+            next_skill_use = {skill: 0.0 for skill in skill_cooldowns}
+        next_lure = 0.0 if lure_interval is not None else None
+
+        def _action(now: float) -> None:
+            nonlocal last_attack, next_lure
+
+            if now - last_attack >= attack_interval:
+                self.game.tap_key(GameBind.ATTACK)
+                last_attack = now
+
+            for skill, cooldown in (skill_cooldowns or {}).items():
+                if now >= next_skill_use[skill]:
+                    self.game.tap_key(skill)
+                    next_skill_use[skill] = now + cooldown
+
+            if lure_interval is not None and next_lure is not None and now >= next_lure:
+                self.game.tap_key(lure_key)
+                next_lure = now + lure_interval
+
+            if extra_callbacks:
+                for callback in extra_callbacks:
+                    callback(now)
+
+        return _action
+
+    def _confirm_template_presence(
+        self,
+        resource: ResourceName,
+        label: str,
+        *,
+        threshold: float = 0.82,
+    ) -> None:
+        detection = self._detect_resource_positions(
+            resource,
+            threshold=threshold,
+        )
+        method = detection.method
+
+        if method == DETECTION_METHOD_FRAME_MISSING:
+            logger.warning("Nie udało się pobrać klatki do potwierdzenia %s.", label)
+            return
+
+        if method == DETECTION_METHOD_UNAVAILABLE:
+            logger.debug(
+                "Pominięto wstępne potwierdzenie %s – brak detektora dla '%s'.",
+                label,
+                resource.value,
+            )
+            return
+
+        if detection.positions:
+            logger.info(
+                "Potwierdzono obecność %s (%s; detekcje: %d).",
+                label,
+                self._detection_method_verbose_label(method),
+                len(detection.positions),
+            )
+        else:
+            if method == DETECTION_METHOD_YOLO:
+                logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+            else:
+                logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
+
+    def _make_template_presence_callback(
+        self,
+        resource: ResourceName,
+        *,
+        label: str,
+        threshold: float = 0.82,
+        interval: float = 4.0,
+    ) -> Callable[[float], None]:
+        state = {"last_check": 0.0, "present": None, "missing_logged": False}
+
+        def _callback(now: float) -> None:
+            if now - state["last_check"] < interval:
                 return
 
-        sleep(0.5)
-
-
-def _use_phoenix_eggs(game: GameController) -> None:
-    logger.info("Otwieram ekwipunek w poszukiwaniu jaj feniksa.")
-    game.tap_key(GameBind.EQ_MENU)
-    sleep(0.4)
-
-    vision = game.vision_detector
-    frame = vision.capture_frame()
-    detected_positions: Tuple[Tuple[int, int], ...] = tuple()
-
-    if frame is None:
-        logger.warning("Nie udało się pobrać klatki ekranu – używam pozycji zapasowych.")
-    else:
-        detection = _detect_resource_positions(
-            vision,
-            ResourceName.WUKONG_PHOENIX_EGG,
-            frame=frame,
-            threshold=0.82,
-        )
-        detected_positions = detection.positions
-        method = detection.method
-        if detected_positions:
-            logger.info(
-                "Wykryto %d jaj feniksa w ekwipunku (%s).",
-                len(detected_positions),
-                _detection_method_verbose_label(method),
+            detection = self._detect_resource_positions(
+                resource,
+                threshold=threshold,
             )
-        else:
+            method = detection.method
+
             if method == DETECTION_METHOD_UNAVAILABLE:
-                logger.debug(
-                    "Brak skonfigurowanego detektora jaj feniksa – korzystam z zapasowych współrzędnych.",
+                if not state["missing_logged"]:
+                    logger.debug(
+                        "Pomijam monitorowanie %s – brak detektora dla '%s'.",
+                        label,
+                        resource.value,
+                    )
+                    state["missing_logged"] = True
+                state["last_check"] = now
+                return
+
+            if method == DETECTION_METHOD_FRAME_MISSING:
+                logger.warning("Nie udało się pobrać klatki do monitorowania %s.", label)
+                state["last_check"] = now
+                return
+
+            present = bool(detection.positions)
+            method_verbose = self._detection_method_verbose_label(method)
+
+            if state["present"] is None:
+                if present:
+                    logger.info("Wykryto %s (%s).", label, method_verbose)
+                else:
+                    if method == DETECTION_METHOD_YOLO:
+                        logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+                    else:
+                        logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
+            elif present != state["present"]:
+                if present:
+                    logger.info("%s ponownie widoczne (%s).", label.capitalize(), method_verbose)
+                else:
+                    logger.success("%s nie są już wykrywane (%s).", label.capitalize(), method_verbose)
+
+            state["present"] = present
+            state["last_check"] = now
+
+        return _callback
+
+    def _make_template_count_callback(
+        self,
+        resource: ResourceName,
+        *,
+        label: str,
+        threshold: float = 0.82,
+        interval: float = 4.0,
+    ) -> Callable[[float], None]:
+        state = {"last_check": 0.0, "count": None, "missing_logged": False}
+
+        def _callback(now: float) -> None:
+            if now - state["last_check"] < interval:
+                return
+
+            detection = self._detect_resource_positions(
+                resource,
+                threshold=threshold,
+            )
+            method = detection.method
+
+            if method == DETECTION_METHOD_UNAVAILABLE:
+                if not state["missing_logged"]:
+                    logger.debug(
+                        "Pomijam monitorowanie %s – brak detektora dla '%s'.",
+                        label,
+                        resource.value,
+                    )
+                    state["missing_logged"] = True
+                state["last_check"] = now
+                return
+
+            if method == DETECTION_METHOD_FRAME_MISSING:
+                logger.warning("Nie udało się pobrać klatki do monitorowania %s.", label)
+                state["last_check"] = now
+                return
+
+            count = len(detection.positions)
+            method_verbose = self._detection_method_verbose_label(method)
+
+            if state["count"] is None:
+                if count:
+                    logger.info("Wykryto %d %s (%s).", count, label, method_verbose)
+                else:
+                    if method == DETECTION_METHOD_YOLO:
+                        logger.debug("Detekcja YOLO nie odnalazła jeszcze %s.", label)
+                    else:
+                        logger.debug("Detekcja szablonowa nie odnalazła jeszcze %s.", label)
+            elif count != state["count"]:
+                if count < state["count"]:
+                    logger.success(
+                        "Pozostało %d %s (poprzednio %d; %s).",
+                        count,
+                        label,
+                        state["count"],
+                        method_verbose,
+                    )
+                else:
+                    logger.warning(
+                        "Liczba %s wzrosła z %d do %d (%s).",
+                        label,
+                        state["count"],
+                        count,
+                        method_verbose,
+                    )
+
+            state["count"] = count
+            state["last_check"] = now
+
+        return _callback
+
+    def _monitor_stage(
+        self,
+        stage: StageDefinition,
+        timeout: float,
+        *,
+        action_callback: Optional[Callable[[float], None]] = None,
+        progress_parser: Optional[Callable[[str], Optional[int]]] = None,
+        completion_keywords: Optional[Sequence[str]] = None,
+        prompt_already_confirmed: bool = False,
+    ) -> None:
+        stage_start = perf_counter()
+        if not prompt_already_confirmed:
+            self._wait_for_stage_prompt(stage, timeout)
+
+        prompt_seen = prompt_already_confirmed
+        last_progress: Optional[int] = None
+        last_message = ""
+
+        while True:
+            now = perf_counter()
+            if now - stage_start > timeout:
+                raise StageTimeoutError(
+                    f"Etap '{stage.title}' przekroczył limit {timeout:.0f}s."
                 )
-            elif method == DETECTION_METHOD_YOLO:
-                logger.debug(
-                    "Detekcja YOLO nie znalazła jaj feniksa – używam pozycji zapasowych.",
+
+            if action_callback is not None:
+                action_callback(now)
+
+            message = self._capture_dungeon_message()
+            if message:
+                if message != last_message:
+                    logger.debug("Komunikat lochów: %s", message)
+                    last_message = message
+
+                if self._message_contains_keywords(message, stage.prompt_keywords):
+                    prompt_seen = True
+                    if progress_parser is not None:
+                        remaining = progress_parser(message)
+                        if remaining is not None and remaining != last_progress:
+                            logger.info("Pozostało: %s", remaining)
+                            last_progress = remaining
+                elif prompt_seen:
+                    if completion_keywords and self._message_contains_keywords(message, completion_keywords):
+                        logger.info("Wykryto komunikat kolejnego etapu: %s", message)
+                    else:
+                        logger.info("Komunikat etapu uległ zmianie: %s", message)
+                    elapsed = now - stage_start
+                    logger.success("Etap '%s' ukończony w %.1fs.", stage.title, elapsed)
+                    return
+
+            sleep(0.5)
+
+    def _use_phoenix_eggs(self) -> None:
+        logger.info("Otwieram ekwipunek w poszukiwaniu jaj feniksa.")
+        self.game.tap_key(GameBind.EQ_MENU)
+        sleep(0.4)
+
+        frame = self.vision.capture_frame()
+        detected_positions: Tuple[Tuple[int, int], ...] = tuple()
+
+        if frame is None:
+            logger.warning("Nie udało się pobrać klatki ekranu – używam pozycji zapasowych.")
+        else:
+            detection = self._detect_resource_positions(
+                ResourceName.WUKONG_PHOENIX_EGG,
+                frame=frame,
+                threshold=0.82,
+            )
+            detected_positions = detection.positions
+            method = detection.method
+            if detected_positions:
+                logger.info(
+                    "Wykryto %d jaj feniksa w ekwipunku (%s).",
+                    len(detected_positions),
+                    self._detection_method_verbose_label(method),
                 )
             else:
-                logger.debug(
-                    "Detekcja szablonowa nie znalazła jaj feniksa – używam pozycji zapasowych.",
+                if method == DETECTION_METHOD_UNAVAILABLE:
+                    logger.debug(
+                        "Brak skonfigurowanego detektora jaj feniksa – korzystam z zapasowych współrzędnych."
+                    )
+                elif method == DETECTION_METHOD_YOLO:
+                    logger.debug(
+                        "Detekcja YOLO nie znalazła jaj feniksa – używam pozycji zapasowych."
+                    )
+                else:
+                    logger.debug(
+                        "Detekcja szablonowa nie znalazła jaj feniksa – używam pozycji zapasowych."
+                    )
+
+        if not detected_positions:
+            if not self.config.egg_slots:
+                logger.warning(
+                    "Brak skonfigurowanych slotów jaj feniksa – oczekuję na ręczne użycie przedmiotu."
                 )
+                fallback_positions: Tuple[Tuple[int, int], ...] = tuple()
+            else:
+                fallback_positions = tuple(
+                    self.vision.get_global_pos(slot) for slot in self.config.egg_slots
+                )
+                logger.info(
+                    "Nie znaleziono jaj poprzez automatyczną detekcję – klikam %d zaprogramowanych slotów.",
+                    len(fallback_positions),
+                )
+            detected_positions = fallback_positions
 
-    if not detected_positions:
-        if not AUTOMATION_CONFIG.egg_slots:
-            logger.warning(
-                "Brak skonfigurowanych slotów jaj feniksa – oczekuję na ręczne użycie przedmiotu."
-            )
-            fallback_positions: Tuple[Tuple[int, int], ...] = tuple()
-        else:
-            fallback_positions = tuple(
-                vision.get_global_pos(slot) for slot in AUTOMATION_CONFIG.egg_slots
-            )
-            logger.info(
-                "Nie znaleziono jaj poprzez automatyczną detekcję – klikam %d zaprogramowanych slotów.",
-                len(fallback_positions),
-            )
-        detected_positions = fallback_positions
+        unique_positions = list(dict.fromkeys(detected_positions))
+        for pos in unique_positions:
+            self.game.click_at(pos, right=True)
+            sleep(0.2)
 
-    unique_positions = list(dict.fromkeys(detected_positions))
-    for pos in unique_positions:
-        game.click_at(pos, right=True)
-        sleep(0.2)
+        self.game.tap_key(GameBind.EQ_MENU)
+        sleep(0.3)
 
-    game.tap_key(GameBind.EQ_MENU)
-    sleep(0.3)
-
-def _parse_stage_timeouts(stage_timeouts: Sequence[float] | str) -> Tuple[float, ...]:
-    """Validate and normalize stage timeout configuration.
-
-    Parameters
-    ----------
-    stage_timeouts:
-        Sequence of per-stage timeout values or a comma separated string.
-    """
-
-    if isinstance(stage_timeouts, str):
-        raw = stage_timeouts.replace(";", ",").replace("\n", ",")
-        items = [item.strip() for item in raw.split(",") if item.strip()]
-    else:
-        items = [str(item) for item in stage_timeouts]
-
-    expected = len(STAGES)
-    if len(items) != expected:
-        raise ValueError(
-            "stage_timeouts must contain exactly "
-            f"{expected} wartości rozdzielonych przecinkiem (po jednej na każdy etap)."
+    def _log_stage_banner(self, stage_index: int, stage: StageDefinition, timeout: float) -> None:
+        logger.info("=" * 72)
+        logger.info(
+            "WuKong etap %s/%s — %s (limit: %ss)",
+            stage_index + 1,
+            len(STAGES),
+            stage.title,
+            timeout,
         )
+        logger.info(stage.objective)
+        if stage.hint:
+            logger.debug(stage.hint)
+        logger.info("=" * 72)
 
-    try:
-        parsed = tuple(float(item) for item in items)
-    except ValueError as exc:  # pragma: no cover - defensive programming
-        raise ValueError(
-            "Nie udało się sparsować stage_timeouts – upewnij się, że podajesz tylko liczby."
-        ) from exc
-
-    return parsed
-
-
-def _validate_start_stage(stage_index: int) -> None:
-    if not 0 <= stage_index < len(STAGES):
-        raise ValueError(
-            f"Stage index {stage_index} is out of bounds for WuKong expedition (0-{len(STAGES) - 1})."
+    def _handle_generic_stage(self, stage: StageDefinition, timeout: float) -> None:
+        logger.warning(
+            "Brak dedykowanego handlera dla etapu '%s' – działanie ograniczone do monitoringu.",
+            stage.title,
         )
-
-
-def _log_stage_banner(stage_index: int, stage: StageDefinition, timeout: float) -> None:
-    logger.info("=" * 72)
-    logger.info(
-        "WuKong etap %s/%s — %s (limit: %ss)",
-        stage_index + 1,
-        len(STAGES),
-        stage.title,
-        timeout,
-    )
-    logger.info(stage.objective)
-    if stage.hint:
-        logger.debug(stage.hint)
-    logger.info("=" * 72)
-
-
-def _handle_generic_stage(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    """Fallback handler that only monitors dungeon messages and respects timeout."""
-
-    logger.warning(
-        "Brak dedykowanego handlera dla etapu '%s' – działanie ograniczone do monitoringu.",
-        stage.title,
-    )
-    _monitor_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        action_callback=None,
-        completion_keywords=stage.completion_keywords,
-        progress_parser=_extract_remaining_count,
-    )
-
-
-def _run_combat_stage(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-    *,
-    attack_interval: float = 1.0,
-    skill_cooldowns: Optional[Dict[UserBind, float]] = None,
-    lure_interval: Optional[float] = None,
-    extra_callbacks: Optional[Sequence[Callable[[float], None]]] = None,
-    progress_parser: Optional[Callable[[str], Optional[int]]] = None,
-) -> None:
-    _prepare_for_combat(game)
-    game.start_attack()
-    action = _make_basic_combat_action(
-        game,
-        attack_interval=attack_interval,
-        skill_cooldowns=skill_cooldowns,
-        lure_interval=lure_interval,
-        extra_callbacks=extra_callbacks,
-    )
-
-    try:
-        _monitor_stage(
-            game,
-            vision,
+        self._monitor_stage(
             stage,
             timeout,
-            action_callback=action,
+            action_callback=None,
             completion_keywords=stage.completion_keywords,
-            progress_parser=progress_parser,
+            progress_parser=self._extract_remaining_count,
         )
-    finally:
-        game.stop_attack()
 
-
-def _execute_restart_sequence(game: GameController, vision: VisionDetector) -> bool:
-    frame = vision.capture_frame()
-    start_pos = vision.locate_template(ResourceName.WUKONG_RESTART, frame=frame, threshold=0.8)
-    fallback_start = (
-        vision.get_global_pos(AUTOMATION_CONFIG.restart_button)
-        if AUTOMATION_CONFIG.restart_button is not None
-        else None
-    )
-
-    if start_pos is not None:
-        logger.info("Wzorzec przycisku restartu odnaleziony – klikam.")
-    elif fallback_start is not None:
-        logger.info(
-            "Nie znaleziono wzorca restartu – klikam zapasowe współrzędne %s.",
-            AUTOMATION_CONFIG.restart_button,
+    def _run_combat_stage(
+        self,
+        stage: StageDefinition,
+        timeout: float,
+        *,
+        attack_interval: float = 1.0,
+        skill_cooldowns: Optional[Dict[UserBind, float]] = None,
+        lure_interval: Optional[float] = None,
+        extra_callbacks: Optional[Sequence[Callable[[float], None]]] = None,
+        progress_parser: Optional[Callable[[str], Optional[int]]] = None,
+        prompt_confirmed: bool = False,
+    ) -> None:
+        self._prepare_for_combat()
+        self.game.start_attack()
+        action = self._make_basic_combat_action(
+            attack_interval=attack_interval,
+            skill_cooldowns=skill_cooldowns,
+            lure_interval=lure_interval,
+            extra_callbacks=extra_callbacks,
         )
-        start_pos = fallback_start
-    else:
-        logger.warning(
-            "Brak szablonu i zapasowych współrzędnych przycisku restartu – oczekuję na kliknięcie ręczne."
+
+        try:
+            self._monitor_stage(
+                stage,
+                timeout,
+                action_callback=action,
+                completion_keywords=stage.completion_keywords,
+                progress_parser=progress_parser,
+                prompt_already_confirmed=prompt_confirmed,
+            )
+        finally:
+            self.game.stop_attack()
+
+    def _execute_restart_sequence(self) -> bool:
+        frame = self.vision.capture_frame()
+        start_pos = self.vision.locate_template(ResourceName.WUKONG_RESTART, frame=frame, threshold=0.8)
+        fallback_start = (
+            self.vision.get_global_pos(self.config.restart_button)
+            if self.config.restart_button is not None
+            else None
         )
-        return False
 
-    game.click_at(start_pos)
-    sleep(0.6)
+        if start_pos is not None:
+            logger.info("Wzorzec przycisku restartu odnaleziony – klikam.")
+        elif fallback_start is not None:
+            logger.info(
+                "Nie znaleziono wzorca restartu – klikam zapasowe współrzędne %s.",
+                self.config.restart_button,
+            )
+            start_pos = fallback_start
+        else:
+            logger.warning(
+                "Brak szablonu i zapasowych współrzędnych przycisku restartu – oczekuję na kliknięcie ręczne."
+            )
+            return False
 
-    frame = vision.capture_frame()
-    confirm_pos = vision.locate_template(ResourceName.WUKONG_RESTART_CONFIRM, frame=frame, threshold=0.8)
-    fallback_confirm = (
-        vision.get_global_pos(AUTOMATION_CONFIG.restart_confirm_button)
-        if AUTOMATION_CONFIG.restart_confirm_button is not None
-        else None
-    )
+        self.game.click_at(start_pos)
+        sleep(0.6)
 
-    if confirm_pos is not None:
-        logger.info("Znalazłem przycisk potwierdzenia restartu – klikam.")
-    elif fallback_confirm is not None:
-        logger.info(
-            "Brak wzorca potwierdzenia – klikam zapasowe współrzędne %s.",
-            AUTOMATION_CONFIG.restart_confirm_button,
+        frame = self.vision.capture_frame()
+        confirm_pos = self.vision.locate_template(ResourceName.WUKONG_RESTART_CONFIRM, frame=frame, threshold=0.8)
+        fallback_confirm = (
+            self.vision.get_global_pos(self.config.restart_confirm_button)
+            if self.config.restart_confirm_button is not None
+            else None
         )
-        confirm_pos = fallback_confirm
-    else:
-        logger.warning("Nie mogę potwierdzić restartu – brak współrzędnych zapasowych.")
-        return False
 
-    game.click_at(confirm_pos)
-    sleep(0.5)
-    return True
+        if confirm_pos is not None:
+            logger.info("Znalazłem przycisk potwierdzenia restartu – klikam.")
+        elif fallback_confirm is not None:
+            logger.info(
+                "Brak wzorca potwierdzenia – klikam zapasowe współrzędne %s.",
+                self.config.restart_confirm_button,
+            )
+            confirm_pos = fallback_confirm
+        else:
+            logger.warning("Nie mogę potwierdzić restartu – brak współrzędnych zapasowych.")
+            return False
 
+        self.game.click_at(confirm_pos)
+        sleep(0.5)
+        return True
 
-def _handle_slay_first_wave(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_MOB,
-        "mobów pierwszej fali WuKonga",
-    )
-    mob_tracker = _make_template_presence_callback(
-        vision,
-        ResourceName.WUKONG_MOB,
-        label="mobów pierwszej fali WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.8,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        extra_callbacks=(mob_tracker,),
-    )
+    # ------------------------------------------------------------------
+    # Stage specific handlers
+    # ------------------------------------------------------------------
 
+    def _handle_slay_first_wave(self, stage: StageDefinition, timeout: float) -> None:
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.8,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            progress_parser=self._extract_remaining_count,
+        )
 
-def _handle_destroy_first_metins(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_METIN,
-        "kamieni Metin WuKonga",
-    )
-    metin_tracker = _make_template_count_callback(
-        vision,
-        ResourceName.WUKONG_METIN,
-        label="kamieni Metin WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.9,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        progress_parser=_extract_remaining_count,
-        extra_callbacks=(metin_tracker,),
-    )
+    def _handle_destroy_first_metins(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_METIN,
+            "kamieni Metin WuKonga",
+        )
+        metin_tracker = self._make_template_count_callback(
+            ResourceName.WUKONG_METIN,
+            label="kamieni Metin WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.9,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(metin_tracker,),
+            progress_parser=self._extract_remaining_count,
+        )
 
+    def _handle_clear_second_wave(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_MOB,
+            "mobów drugiej fali WuKonga",
+        )
+        mob_tracker = self._make_template_presence_callback(
+            ResourceName.WUKONG_MOB,
+            label="mobów drugiej fali WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.8,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(mob_tracker,),
+        )
 
-def _handle_clear_second_wave(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_MOB,
-        "mobów drugiej fali WuKonga",
-    )
-    mob_tracker = _make_template_presence_callback(
-        vision,
-        ResourceName.WUKONG_MOB,
-        label="mobów drugiej fali WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.8,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        extra_callbacks=(mob_tracker,),
-    )
+    def _handle_defeat_cloud_guardian(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_CLOUD_GUARDIAN,
+            "Obrońcę Chmur WuKonga",
+        )
+        guardian_tracker = self._make_template_presence_callback(
+            ResourceName.WUKONG_CLOUD_GUARDIAN,
+            label="Obrońcę Chmur WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.7,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(guardian_tracker,),
+        )
 
+    def _handle_place_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> None:
+        last_egg_usage = {"time": 0.0}
 
-def _handle_defeat_cloud_guardian(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_CLOUD_GUARDIAN,
-        "Obrońcę Chmur WuKonga",
-    )
-    guardian_tracker = _make_template_presence_callback(
-        vision,
-        ResourceName.WUKONG_CLOUD_GUARDIAN,
-        label="Obrońcę Chmur WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.7,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        extra_callbacks=(guardian_tracker,),
-    )
+        def _egg_callback(now: float) -> None:
+            if now - last_egg_usage["time"] < 8.0:
+                return
+            self._use_phoenix_eggs()
+            last_egg_usage["time"] = now
 
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.8,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(_egg_callback,),
+            progress_parser=self._extract_remaining_count,
+        )
 
-def _handle_place_phoenix_eggs(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    last_egg_usage = {"time": 0.0}
+    def _handle_destroy_phoenix_eggs(self, stage: StageDefinition, timeout: float) -> None:
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.75,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            progress_parser=self._extract_remaining_count,
+        )
 
-    def _egg_callback(now: float) -> None:
-        if now - last_egg_usage["time"] < 8.0:
-            return
-        _use_phoenix_eggs(game)
-        last_egg_usage["time"] = now
+    def _handle_repel_three_waves(self, stage: StageDefinition, timeout: float) -> None:
+        logger.info("Aktywuję pelerynę (F4), aby przyspieszyć pojawianie się fal.")
+        self.game.tap_key(UserBind.MARMUREK)
 
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.8,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        extra_callbacks=(_egg_callback,),
-        progress_parser=_extract_remaining_count,
-    )
+        self._confirm_template_presence(
+            ResourceName.WUKONG_MOB,
+            "przeciwników w falach WuKonga",
+        )
+        mob_tracker = self._make_template_presence_callback(
+            ResourceName.WUKONG_MOB,
+            label="przeciwników w falach WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.85,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            lure_interval=25.0,
+            progress_parser=self._extract_remaining_count,
+            extra_callbacks=(mob_tracker,),
+        )
 
+    def _handle_destroy_second_metin(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_METIN,
+            "ostatnich kamieni Metin WuKonga",
+        )
+        metin_tracker = self._make_template_count_callback(
+            ResourceName.WUKONG_METIN,
+            label="kamieni Metin WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.9,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            progress_parser=self._extract_remaining_count,
+            extra_callbacks=(metin_tracker,),
+        )
 
-def _handle_destroy_phoenix_eggs(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.75,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        progress_parser=_extract_remaining_count,
-    )
+    def _handle_defeat_flaming_phoenix(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_FLAMING_PHOENIX,
+            "Płomiennego Feniksa WuKonga",
+        )
+        phoenix_tracker = self._make_template_presence_callback(
+            ResourceName.WUKONG_FLAMING_PHOENIX,
+            label="Płomiennego Feniksa WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.7,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(phoenix_tracker,),
+        )
 
+    def _handle_clear_final_wave(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_MOB,
+            "ostatnich przeciwników WuKonga",
+        )
+        mob_tracker = self._make_template_presence_callback(
+            ResourceName.WUKONG_MOB,
+            label="ostatnich przeciwników WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.8,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(mob_tracker,),
+        )
 
-def _handle_repel_three_waves(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    logger.info("Aktywuję pelerynę (F4), aby przyspieszyć pojawianie się fal.")
-    game.tap_key(UserBind.MARMUREK)
+    def _handle_destroy_crimson_gourds(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_CRIMSON_GOURD,
+            "Karmazynowych Gurd",
+        )
+        gourd_tracker = self._make_template_count_callback(
+            ResourceName.WUKONG_CRIMSON_GOURD,
+            label="Karmazynowych Gurd",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.85,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            progress_parser=self._extract_remaining_count,
+            extra_callbacks=(gourd_tracker,),
+        )
 
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_MOB,
-        "przeciwników w falach WuKonga",
-    )
-    mob_tracker = _make_template_presence_callback(
-        vision,
-        ResourceName.WUKONG_MOB,
-        label="przeciwników w falach WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.85,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        lure_interval=25.0,
-        progress_parser=_extract_remaining_count,
-        extra_callbacks=(mob_tracker,),
-    )
+    def _handle_defeat_wukong(self, stage: StageDefinition, timeout: float) -> None:
+        self._confirm_template_presence(
+            ResourceName.WUKONG_MONKEY_KING,
+            "Małpiego Króla WuKonga",
+        )
+        boss_tracker = self._make_template_presence_callback(
+            ResourceName.WUKONG_MONKEY_KING,
+            label="Małpiego Króla WuKonga",
+        )
+        self._run_combat_stage(
+            stage,
+            timeout,
+            attack_interval=0.65,
+            skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
+            extra_callbacks=(boss_tracker,),
+        )
 
-
-def _handle_destroy_second_metin(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_METIN,
-        "ostatnich kamieni Metin WuKonga",
-    )
-    metin_tracker = _make_template_count_callback(
-        vision,
-        ResourceName.WUKONG_METIN,
-        label="kamieni Metin WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.9,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        progress_parser=_extract_remaining_count,
-        extra_callbacks=(metin_tracker,),
-    )
-
-
-def _handle_defeat_flaming_phoenix(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_FLAMING_PHOENIX,
-        "Płomiennego Feniksa WuKonga",
-    )
-    phoenix_tracker = _make_template_presence_callback(
-        vision,
-        ResourceName.WUKONG_FLAMING_PHOENIX,
-        label="Płomiennego Feniksa WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.7,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        extra_callbacks=(phoenix_tracker,),
-    )
-
-
-def _handle_clear_final_wave(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_MOB,
-        "ostatnich przeciwników WuKonga",
-    )
-    mob_tracker = _make_template_presence_callback(
-        vision,
-        ResourceName.WUKONG_MOB,
-        label="ostatnich przeciwników WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.8,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        extra_callbacks=(mob_tracker,),
-    )
-
-
-def _handle_destroy_crimson_gourds(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_CRIMSON_GOURD,
-        "Karmazynowych Gurd",
-    )
-    gourd_tracker = _make_template_count_callback(
-        vision,
-        ResourceName.WUKONG_CRIMSON_GOURD,
-        label="Karmazynowych Gurd",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.85,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        progress_parser=_extract_remaining_count,
-        extra_callbacks=(gourd_tracker,),
-    )
-
-
-def _handle_defeat_wukong(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _confirm_template_presence(
-        vision,
-        ResourceName.WUKONG_MONKEY_KING,
-        "Małpiego Króla WuKonga",
-    )
-    boss_tracker = _make_template_presence_callback(
-        vision,
-        ResourceName.WUKONG_MONKEY_KING,
-        label="Małpiego Króla WuKonga",
-    )
-    _run_combat_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        attack_interval=0.65,
-        skill_cooldowns=DEFAULT_SKILL_COOLDOWNS,
-        extra_callbacks=(boss_tracker,),
-    )
-
-
-def _handle_restart_expedition(
-    game: GameController,
-    vision: VisionDetector,
-    stage: StageDefinition,
-    timeout: float,
-) -> None:
-    _wait_for_stage_prompt(vision, stage, timeout)
-
-    _execute_restart_sequence(game, vision)
-
-    _monitor_stage(
-        game,
-        vision,
-        stage,
-        timeout,
-        action_callback=None,
-        completion_keywords=stage.completion_keywords,
-        prompt_already_confirmed=True,
-    )
-
-STAGE_HANDLERS: Dict[str, StageHandler] = {
-    "slay_first_wave": _handle_slay_first_wave,
-    "destroy_first_metins": _handle_destroy_first_metins,
-    "clear_second_wave": _handle_clear_second_wave,
-    "defeat_cloud_guardian": _handle_defeat_cloud_guardian,
-    "place_phoenix_eggs": _handle_place_phoenix_eggs,
-    "destroy_phoenix_eggs": _handle_destroy_phoenix_eggs,
-    "repel_three_waves": _handle_repel_three_waves,
-    "destroy_second_metin": _handle_destroy_second_metin,
-    "defeat_flaming_phoenix": _handle_defeat_flaming_phoenix,
-    "clear_final_wave": _handle_clear_final_wave,
-    "destroy_crimson_gourds": _handle_destroy_crimson_gourds,
-    "defeat_wukong": _handle_defeat_wukong,
-    "restart_expedition": _handle_restart_expedition,
-}
+    def _handle_restart_expedition(self, stage: StageDefinition, timeout: float) -> None:
+        self._wait_for_stage_prompt(stage, timeout)
+        if self._execute_restart_sequence():
+            logger.success("Próba restartu wyprawy zakończona powodzeniem.")
+        else:
+            logger.warning("Restart wyprawy wymaga ręcznej interwencji.")
+        self._monitor_stage(
+            stage,
+            timeout,
+            action_callback=None,
+            completion_keywords=stage.completion_keywords,
+            progress_parser=self._extract_remaining_count,
+            prompt_already_confirmed=True,
+        )
 
 
 def run(
@@ -1461,51 +1357,14 @@ def run(
     yolo_confidence_threshold: float = DEFAULT_YOLO_CONFIDENCE_THRESHOLD,
     yolo_device: str = DEFAULT_YOLO_DEVICE,
 ) -> None:
-    """Run WuKong expedition automation starting from the requested stage."""
-
-    log_level = log_level.upper()
-
-    global _YOLO_CONFIDENCE_THRESHOLD, _YOLO_VERBOSE
-    _YOLO_CONFIDENCE_THRESHOLD = float(yolo_confidence_threshold)
-    _YOLO_VERBOSE = log_level in {"TRACE", "DEBUG"}
-
-    _initialize_yolo_model(yolo_device)
-    if _YOLO_MODEL is None:
-        logger.warning(
-            "Model YOLO WuKonga nie został załadowany – wykorzystywane będą jedynie dostępne szablony.",
-        )
-
-    stage_timeouts_tuple = _parse_stage_timeouts(stage_timeouts)
-    _validate_start_stage(stage)
-
-    global AUTOMATION_CONFIG, _BUFFS_INITIALIZED
-    AUTOMATION_CONFIG = _load_wukong_config()
-    _BUFFS_INITIALIZED = False
-    logger.debug("Załadowana konfiguracja WuKonga: %s", AUTOMATION_CONFIG)
-
-    vision = VisionDetector()
-    game = GameController(vision_detector=vision, start_delay=2, saved_credentials_idx=saved_credentials_idx)
-
-    start_time = perf_counter()
-    aborted = False
-    for idx in range(stage, len(STAGES)):
-        stage_def = STAGES[idx]
-        timeout = stage_timeouts_tuple[idx]
-        _log_stage_banner(idx, stage_def, timeout)
-        handler = STAGE_HANDLERS.get(stage_def.key, _handle_generic_stage)
-        try:
-            handler(game, vision, stage_def, timeout)
-        except StageTimeoutError as exc:
-            logger.error(str(exc))
-            aborted = True
-            break
-
-    elapsed = perf_counter() - start_time
-    if aborted:
-        logger.error("WuKong expedition przerwana po %.2fs z powodu przekroczonego limitu.", elapsed)
-    else:
-        logger.success("WuKong expedition flow finished in %.2fs", elapsed)
-    game.reset_game_state()
+    automation = WuKongAutomation(
+        log_level=log_level,
+        saved_credentials_idx=saved_credentials_idx,
+        stage_timeouts=stage_timeouts,
+        yolo_confidence_threshold=yolo_confidence_threshold,
+        yolo_device=yolo_device,
+    )
+    automation.run(stage)
 
 
 @click.command()
@@ -1545,8 +1404,6 @@ def main(
     yolo_confidence_threshold: float,
     yolo_device: str,
 ) -> None:
-    """CLI entrypoint mirroring :mod:`dung_polana`."""
-
     log_level = log_level.upper()
     setup_logger(script_name=Path(__file__).name, level=log_level)
     logger.warning("Starting the WuKong expedition bot...")
