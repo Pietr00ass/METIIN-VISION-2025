@@ -115,6 +115,7 @@ DETECTION_METHOD_UNAVAILABLE = "unavailable"
 
 REMAINING_PATTERN = re.compile(r"pozostał[oa]?\s*:?\s*(\d+)")
 PROMPT_WAIT_LIMIT = 15.0
+CLOAK_REFRESH_INTERVAL = 45.0
 
 DEFAULT_STAGE_TIMEOUTS: Tuple[float, ...] = (
     90,
@@ -276,6 +277,8 @@ class WuKongAutomation:
         )
 
         self._buffs_initialized = False
+        self._cloak_initialized = False
+        self._last_cloak_activation = 0.0
         self._yolo_model: YOLO | None = None
         self._yolo_class_ids: Dict[ResourceName, int] = {}
 
@@ -880,6 +883,20 @@ class WuKongAutomation:
         self.game.toggle_passive_skills(reset_animation=False)
         self._buffs_initialized = True
 
+    def _ensure_cloak_active(self, now: float) -> None:
+        if not self._cloak_initialized or now - self._last_cloak_activation >= CLOAK_REFRESH_INTERVAL:
+            if not self._cloak_initialized:
+                logger.info(
+                    "Aktywuję pelerynę (F4), aby przyciągać przeciwników przez całą wyprawę."
+                )
+            else:
+                logger.debug(
+                    "Odświeżam działanie peleryny (F4), aby utrzymać efekt przez całą wyprawę."
+                )
+            self.game.tap_key(UserBind.MARMUREK)
+            self._cloak_initialized = True
+            self._last_cloak_activation = now
+
     def _make_basic_combat_action(
         self,
         *,
@@ -1124,6 +1141,8 @@ class WuKongAutomation:
                 raise StageTimeoutError(
                     f"Etap '{stage.title}' przekroczył limit {timeout:.0f}s."
                 )
+
+            self._ensure_cloak_active(now)
 
             if action_callback is not None:
                 action_callback(now)
@@ -1477,8 +1496,8 @@ class WuKongAutomation:
         )
 
     def _handle_repel_three_waves(self, stage: StageDefinition, timeout: float) -> float:
-        logger.info("Aktywuję pelerynę (F4), aby przyspieszyć pojawianie się fal.")
-        self.game.tap_key(UserBind.MARMUREK)
+        logger.debug("Potwierdzam aktywną pelerynę (F4) przed rozpoczęciem fal.")
+        self._ensure_cloak_active(perf_counter())
 
         self._confirm_template_presence(
             ResourceName.WUKONG_MOB,
