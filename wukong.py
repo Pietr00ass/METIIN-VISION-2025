@@ -298,6 +298,9 @@ class WuKongAutomation:
         self._buffs_initialized = False
         self._cloak_initialized = False
         self._last_cloak_activation = 0.0
+        self._first_wave_prepared = False
+        self._second_wave_prepared = False
+        self._three_waves_prepared = False
         self._yolo_model: YOLO | None = None
         self._yolo_class_ids: Dict[ResourceName, int] = {}
 
@@ -385,6 +388,9 @@ class WuKongAutomation:
             self._buffs_initialized = False
             self._cloak_initialized = False
             self._last_cloak_activation = 0.0
+            self._first_wave_prepared = False
+            self._second_wave_prepared = False
+            self._three_waves_prepared = False
 
         while self.game.is_running and stage_index < stage_count:
             stage = STAGES[stage_index]
@@ -1665,6 +1671,13 @@ class WuKongAutomation:
         self._initiate_stage_reset(reason)
 
     def _handle_slay_first_wave(self, stage: StageDefinition, timeout: float) -> float:
+        if not self._first_wave_prepared:
+            logger.debug("Inicjalizuję przygotowanie postaci przed pierwszą falą.")
+            self.game.polymorph_off()
+            self.game.mount()
+            self.game.calibrate_camera()
+            self._first_wave_prepared = True
+
         mob_tracker = self._make_template_presence_callback(
             ResourceName.WUKONG_MOB,
             label="przeciwników WuKonga",
@@ -1710,6 +1723,13 @@ class WuKongAutomation:
         )
 
     def _handle_clear_second_wave(self, stage: StageDefinition, timeout: float) -> float:
+        if not self._second_wave_prepared:
+            logger.debug("Przygotowuję postać przed drugą falą WuKonga.")
+            self.game.polymorph_off()
+            self.game.mount()
+            self.game.calibrate_camera()
+            self._second_wave_prepared = True
+
         self._confirm_template_presence(
             ResourceName.WUKONG_MOB,
             "mobów drugiej fali WuKonga",
@@ -1810,6 +1830,13 @@ class WuKongAutomation:
         )
 
     def _handle_repel_three_waves(self, stage: StageDefinition, timeout: float) -> float:
+        if not self._three_waves_prepared:
+            logger.debug("Przygotowuję postać przed potrójną falą WuKonga.")
+            self.game.polymorph_off()
+            self.game.mount()
+            self.game.calibrate_camera()
+            self._three_waves_prepared = True
+
         logger.debug("Potwierdzam aktywną pelerynę (F4) przed rozpoczęciem fal.")
         self._ensure_cloak_active(perf_counter())
 
