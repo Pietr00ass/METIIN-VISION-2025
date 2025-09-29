@@ -21,9 +21,9 @@ from loguru import logger
 from ultralytics import YOLO
 from ultralytics import checks as yolo_checks
 
-from game_controller import GameController
+from game_controller import GameController, Key
 from settings import GameBind, ResourceName, UserBind, MODELS_DIR
-from utils import setup_logger
+from utils import channel_generator, setup_logger
 from vision_detector import VisionDetector
 
 
@@ -77,6 +77,9 @@ DEFAULT_AUTOMATION_CONFIG = WuKongAutomationConfig(
     restart_button=DEFAULT_RESTART_BUTTON,
     restart_confirm_button=DEFAULT_RESTART_CONFIRM_BUTTON,
 )
+
+
+DEFAULT_LOADING_TIMEOUT = 10.0
 
 
 WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
@@ -275,6 +278,7 @@ class WuKongAutomation:
             start_delay=2,
             saved_credentials_idx=self.saved_credentials_idx,
         )
+        self._channel_gen = channel_generator()
 
         self._buffs_initialized = False
         self._cloak_initialized = False
@@ -350,12 +354,93 @@ class WuKongAutomation:
                 "Model YOLO WuKonga nie został załadowany – wykorzystywane będą jedynie dostępne szablony."
             )
 
-        for idx in range(start_stage, len(STAGES)):
-            stage = STAGES[idx]
-            timeout = self.stage_timeouts[idx]
-            self._log_stage_banner(idx, stage, timeout)
+        stage_count = len(STAGES)
+        stage_index = start_stage
+        stage_start_times: list[Optional[float]] = [None] * stage_count
+
+        def _reset_progress() -> None:
+            nonlocal stage_index, stage_durations, stage_start_times
+            logger.info("Zresetowano postęp wyprawy WuKonga – wracam do pierwszego etapu.")
+            stage_index = 0
+            stage_durations.clear()
+            self._last_stage_durations = []
+            stage_start_times = [None] * stage_count
+
+        while self.game.is_running and stage_index < stage_count:
+            stage = STAGES[stage_index]
+            timeout = self.stage_timeouts[stage_index]
+            self._log_stage_banner(stage_index, stage, timeout)
 
             handler = self._stage_handlers.get(stage.key, self._handle_generic_stage)
+
+            if stage_start_times[stage_index] is None:
+                stage_start_times[stage_index] = perf_counter()
+
+            stage_ready = False
+
+            while self.game.is_running and not stage_ready:
+                frame = self.vision.capture_frame()
+
+                if frame is None:
+                    logger.warning("Nie udało się przechwycić klatki – restartuję grę.")
+                    self.game.restart_game()
+                    _reset_progress()
+                    break
+
+                if self.vision.logged_out(frame):
+                    logger.warning("Wykryto ekran logowania. Ponowne logowanie i zmiana kanału...")
+                    self.game.login()
+                    sleep(3)
+                    self.game.change_to_channel(next(self._channel_gen))
+                    _reset_progress()
+                    break
+
+                if self.vision.is_loading(frame):
+                    sleep(DEFAULT_LOADING_TIMEOUT)
+                    followup_frame = self.vision.capture_frame()
+                    if followup_frame is None:
+                        logger.warning("Nie udało się przechwycić klatki po ekranie ładowania – restartuję grę.")
+                        self.game.restart_game()
+                        _reset_progress()
+                        break
+                    if self.vision.is_loading(followup_frame):
+                        logger.warning(
+                            "Ładowanie trwa zbyt długo (>%ss). Wracam do menu logowania.",
+                            DEFAULT_LOADING_TIMEOUT,
+                        )
+                        self.game.tap_key(Key.esc, press_time=2)
+                        sleep(5)
+                        continue
+                    continue
+
+                valium_frame = self.vision.capture_frame()
+                if valium_frame is None:
+                    logger.warning("Nie udało się pobrać klatki do detekcji wiadomości Valium – restartuję grę.")
+                    self.game.restart_game()
+                    _reset_progress()
+                    break
+                if self.vision.frame_contains_valium_message(valium_frame):
+                    butelka_frame = self.vision.capture_frame()
+                    if butelka_frame is None:
+                        logger.warning("Brak klatki do obsługi butelki dywizji – restartuję grę.")
+                        self.game.restart_game()
+                        _reset_progress()
+                        break
+                    if self.vision.detect_butelka_dywizji_filled_message(butelka_frame):
+                        self.game.move_full_butelka_dywizji()
+                        self.game.use_next_butelka_dywizji()
+                    logger.warning("Wiadomość Valium wykryta. Odczekuję 5 sekund przed kontynuacją.")
+                    sleep(5)
+                    continue
+
+                stage_ready = True
+
+            if not self.game.is_running:
+                break
+
+            if not stage_ready:
+                continue
+
             try:
                 duration = handler(stage, timeout)
             except StageTimeoutError as exc:
@@ -363,8 +448,9 @@ class WuKongAutomation:
                 aborted = True
                 break
             else:
-                stage_durations.append((idx, duration))
+                stage_durations.append((stage_index, duration))
                 self._last_stage_durations.append((stage.key, duration))
+                stage_index += 1
 
         if stage_durations:
             logger.info("Podsumowanie ukończonych etapów WuKonga:")
