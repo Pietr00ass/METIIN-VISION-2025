@@ -77,6 +77,7 @@ class ResourceName(Enum):
     WUKONG_MONKEY_KING = "wukong_monkey_king"
     WUKONG_CLOUD_GUARDIAN = "wukong_cloud_guardian"
     WUKONG_FLAMING_PHOENIX = "wukong_flaming_phoenix"
+    WUKONG_DUNGEON_NPC = "wukong_dungeon_npc"
 
 
 # WINDOW_NAME = "Akademia Valium.pl"

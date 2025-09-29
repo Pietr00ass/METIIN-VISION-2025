@@ -52,6 +52,10 @@ class StageTimeoutError(RuntimeError):
     """Raised when a WuKong stage exceeds its allotted timeout."""
 
 
+class StageResetRequested(RuntimeError):
+    """Raised when the automation should restart the WuKong stage sequence."""
+
+
 CONFIG_PATH = Path("data/wukong_config.json")
 YOLO_MODEL_FILENAME = "wukong.pt"
 DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.6
@@ -90,6 +94,7 @@ WUKONG_YOLO_ALIASES: Dict[ResourceName, Tuple[str, ...]] = {
     ResourceName.WUKONG_CLOUD_GUARDIAN: ("wukong_cloud_guardian", "obronca_chmur"),
     ResourceName.WUKONG_PHOENIX_EGG: ("wukong_phoenix_egg", "jajo", "jaja_feniksa"),
     ResourceName.WUKONG_FLAMING_PHOENIX: ("wukong_flaming_phoenix", "plomienny_feniks"),
+    ResourceName.WUKONG_DUNGEON_NPC: ("wukong_dungeon_npc", "dungeon_npc"),
 }
 
 WUKONG_RESOURCE_LABELS: Dict[ResourceName, str] = {
@@ -100,6 +105,7 @@ WUKONG_RESOURCE_LABELS: Dict[ResourceName, str] = {
     ResourceName.WUKONG_CLOUD_GUARDIAN: "Obrońcę Chmur WuKonga",
     ResourceName.WUKONG_PHOENIX_EGG: "jaj Feniksa WuKonga",
     ResourceName.WUKONG_FLAMING_PHOENIX: "Płomiennego Feniksa WuKonga",
+    ResourceName.WUKONG_DUNGEON_NPC: "strażnika wyprawy WuKonga",
 }
 
 _OPTIONAL_YOLO_RESOURCES = {ResourceName.WUKONG_PHOENIX_EGG}
@@ -121,6 +127,7 @@ PROMPT_WAIT_LIMIT = 15.0
 CLOAK_REFRESH_INTERVAL = 45.0
 
 DEFAULT_STAGE_TIMEOUTS: Tuple[float, ...] = (
+    120,
     90,
     180,
     120,
@@ -143,6 +150,13 @@ DEFAULT_SKILL_COOLDOWNS: Dict[UserBind, float] = {
 
 
 STAGES: Tuple[StageDefinition, ...] = (
+    StageDefinition(
+        key="before_enter",
+        title="Przygotuj wejście do wyprawy",
+        objective="Porozmawiaj ze strażnikiem i ustaw kamerę przed rozpoczęciem walk.",
+        hint="Zadbaj o przybliżenie oraz opuszczenie kamery dla lepszej widoczności areny.",
+        completion_keywords=("pokonaj", "potwory"),
+    ),
     StageDefinition(
         key="slay_first_wave",
         title="Pokonaj potwory",
@@ -280,6 +294,7 @@ class WuKongAutomation:
         )
         self._channel_gen = channel_generator()
 
+        self._entry_prepared = False
         self._buffs_initialized = False
         self._cloak_initialized = False
         self._last_cloak_activation = 0.0
@@ -289,6 +304,7 @@ class WuKongAutomation:
         self._initialize_yolo_model()
 
         self._stage_handlers: Dict[str, Callable[[StageDefinition, float], float]] = {
+            "before_enter": self._handle_before_enter,
             "slay_first_wave": self._handle_slay_first_wave,
             "destroy_first_metins": self._handle_destroy_first_metins,
             "clear_second_wave": self._handle_clear_second_wave,
@@ -365,6 +381,10 @@ class WuKongAutomation:
             stage_durations.clear()
             self._last_stage_durations = []
             stage_start_times = [None] * stage_count
+            self._entry_prepared = False
+            self._buffs_initialized = False
+            self._cloak_initialized = False
+            self._last_cloak_activation = 0.0
 
         while self.game.is_running and stage_index < stage_count:
             stage = STAGES[stage_index]
@@ -443,6 +463,10 @@ class WuKongAutomation:
 
             try:
                 duration = handler(stage, timeout)
+            except StageResetRequested as exc:
+                logger.warning(str(exc))
+                _reset_progress()
+                continue
             except StageTimeoutError as exc:
                 logger.error(str(exc))
                 aborted = True
@@ -1384,6 +1408,27 @@ class WuKongAutomation:
 
             sleep(0.5)
 
+    def _initiate_stage_reset(self, reason: str) -> None:
+        message = reason.rstrip(".") if reason else "Reset wyprawy WuKonga"
+        if message:
+            message = f"{message}. Resetuję wyprawę i wracam do strażnika."
+        else:
+            message = "Resetuję wyprawę i wracam do strażnika."
+
+        self.game.stop_attack()
+        self.game.tap_key(Key.enter)
+        sleep(0.5)
+        self.game.teleport_to_polana()
+        sleep(3.0)
+        self.game.change_to_channel(next(self._channel_gen))
+
+        self._entry_prepared = False
+        self._buffs_initialized = False
+        self._cloak_initialized = False
+        self._last_cloak_activation = 0.0
+
+        raise StageResetRequested(message)
+
     def _use_phoenix_eggs(self) -> None:
         logger.info("Otwieram ekwipunek w poszukiwaniu jaj feniksa.")
         self.game.tap_key(GameBind.EQ_MENU)
@@ -1561,6 +1606,63 @@ class WuKongAutomation:
     # ------------------------------------------------------------------
     # Stage specific handlers
     # ------------------------------------------------------------------
+
+    def _handle_before_enter(self, stage: StageDefinition, timeout: float) -> float:
+        stage_start = perf_counter()
+        self._wait_for_stage_prompt(stage, timeout)
+
+        if not self._entry_prepared:
+            logger.info("Przygotowuję postać i kamerę przed wejściem do wyprawy WuKonga.")
+            self.game.unmount()
+            self.game.calibrate_camera()
+            self.game.zoomin_camera(press_time=0.3)
+            self.game.move_camera_down(press_time=0.8)
+            self._entry_prepared = True
+
+        npc_resource = ResourceName.WUKONG_DUNGEON_NPC
+        npc_label = WUKONG_RESOURCE_LABELS.get(npc_resource, "strażnika WuKonga")
+        deadline = stage_start + timeout
+        detection_unavailable_logged = False
+        center_global = self.vision.get_global_pos(self.vision.center)
+
+        while perf_counter() <= deadline:
+            detection = self._detect_resource_positions(npc_resource)
+            method = detection.method
+
+            if detection.positions:
+                target = min(
+                    detection.positions,
+                    key=lambda pos: (pos[0] - center_global[0]) ** 2
+                    + (pos[1] - center_global[1]) ** 2,
+                )
+                method_verbose = self._detection_method_verbose_label(method)
+                logger.info("Namierzono %s (%s) – rozpoczynam interakcję.", npc_label, method_verbose)
+                self.game.click_at(target)
+                sleep(2.0)
+                self.game.tap_key(Key.enter)
+                sleep(1.5)
+                self.game.tap_key(Key.enter)
+                sleep(5.0)
+                elapsed = perf_counter() - stage_start
+                logger.success("Etap '%s' ukończony w %.1fs.", stage.title, elapsed)
+                return elapsed
+
+            if method == DETECTION_METHOD_UNAVAILABLE:
+                if not detection_unavailable_logged:
+                    reason = (
+                        f"Automatyczna detekcja {npc_label} jest niedostępna – konieczny reset wyprawy"
+                    )
+                    detection_unavailable_logged = True
+                    self._initiate_stage_reset(reason)
+                continue
+
+            if method == DETECTION_METHOD_FRAME_MISSING:
+                continue
+
+            sleep(1.0)
+
+        reason = f"Nie znaleziono {npc_label} w limicie czasu {timeout:.0f}s"
+        self._initiate_stage_reset(reason)
 
     def _handle_slay_first_wave(self, stage: StageDefinition, timeout: float) -> float:
         mob_tracker = self._make_template_presence_callback(
